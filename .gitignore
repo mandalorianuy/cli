@@ -45,6 +45,9 @@ files.jsonl
 # Plans (local design docs)
 docs/plans/
 
+# Local Git worktrees
+.worktrees/
+
 # Generated
 demo.mp4
 download.html

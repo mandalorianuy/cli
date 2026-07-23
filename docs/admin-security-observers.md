@@ -69,7 +69,10 @@ raises findings for:
 - OAuth application authorization.
 
 Output is structured JSON by default and includes `mode: "read-only"` so
-automations can fail closed if the contract changes.
+automations can fail closed if the contract changes. Every finding also carries
+an `eventId`, `eventTime`, `source`, and `occurrences` value. Consumers should
+use `eventId` as their idempotency key when appending overlapping observer
+windows to a durable store such as Google Sheets.
 
 ## Alerting boundary
 

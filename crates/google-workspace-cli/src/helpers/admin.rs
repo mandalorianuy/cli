@@ -69,10 +69,64 @@ enum Severity {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Finding {
+    event_id: String,
+    event_time: Option<String>,
+    source: String,
     severity: Severity,
     rule: &'static str,
     actor: String,
     ip_address: Option<String>,
+    occurrences: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ActivityMetadata {
+    source: String,
+    qualifier: String,
+    event_time: Option<String>,
+}
+
+impl ActivityMetadata {
+    fn from_activity(activity: &Value) -> Self {
+        Self {
+            source: activity
+                .pointer("/id/applicationName")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            qualifier: activity
+                .pointer("/id/uniqueQualifier")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            event_time: activity
+                .pointer("/id/time")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    fn event_id(&self, event_name: &str, event_index: usize) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.source, self.qualifier, event_name, event_index
+        )
+    }
+
+    fn burst_event_id(&self) -> String {
+        format!("{}:{}:repeated_login_failures", self.source, self.qualifier)
+    }
+
+    fn is_later_than(&self, other: &Self) -> bool {
+        self.event_time.as_deref().unwrap_or_default()
+            > other.event_time.as_deref().unwrap_or_default()
+    }
+}
+
+struct FailedLoginBurst {
+    count: usize,
+    ip_address: Option<String>,
+    latest: ActivityMetadata,
 }
 
 fn event_bool_parameter(event: &Value, name: &str) -> bool {
@@ -102,9 +156,10 @@ fn activities_from_response(response: &Value) -> (Vec<Value>, Option<String>) {
 
 fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let mut failed_logins: HashMap<String, (usize, Option<String>)> = HashMap::new();
+    let mut failed_logins: HashMap<String, FailedLoginBurst> = HashMap::new();
 
     for activity in activities {
+        let metadata = ActivityMetadata::from_activity(activity);
         let actor = activity
             .pointer("/actor/email")
             .and_then(Value::as_str)
@@ -115,20 +170,30 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        for event in activity
+        for (event_index, event) in activity
             .get("events")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
             let Some(event_name) = event.get("name").and_then(Value::as_str) else {
                 continue;
             };
             if event_name == "login_failure" {
-                let entry = failed_logins
-                    .entry(actor.clone())
-                    .or_insert_with(|| (0, ip_address.clone()));
-                entry.0 += 1;
+                let entry =
+                    failed_logins
+                        .entry(actor.clone())
+                        .or_insert_with(|| FailedLoginBurst {
+                            count: 0,
+                            ip_address: ip_address.clone(),
+                            latest: metadata.clone(),
+                        });
+                entry.count += 1;
+                if metadata.is_later_than(&entry.latest) {
+                    entry.latest = metadata.clone();
+                    entry.ip_address = ip_address.clone();
+                }
                 continue;
             }
             let critical_rule = match event_name {
@@ -147,10 +212,14 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
 
             if let Some(rule) = critical_rule {
                 findings.push(Finding {
+                    event_id: metadata.event_id(event_name, event_index),
+                    event_time: metadata.event_time.clone(),
+                    source: metadata.source.clone(),
                     severity: Severity::Critical,
                     rule,
                     actor: actor.clone(),
                     ip_address: ip_address.clone(),
+                    occurrences: 1,
                 });
                 continue;
             }
@@ -170,10 +239,14 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
 
             if let Some(rule) = high_rule {
                 findings.push(Finding {
+                    event_id: metadata.event_id(event_name, event_index),
+                    event_time: metadata.event_time.clone(),
+                    source: metadata.source.clone(),
                     severity: Severity::High,
                     rule,
                     actor: actor.clone(),
                     ip_address: ip_address.clone(),
+                    occurrences: 1,
                 });
             }
         }
@@ -182,12 +255,16 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
     findings.extend(
         failed_logins
             .into_iter()
-            .filter(|(_, (count, _))| *count >= 5)
-            .map(|(actor, (_, ip_address))| Finding {
+            .filter(|(_, burst)| burst.count >= 5)
+            .map(|(actor, burst)| Finding {
+                event_id: burst.latest.burst_event_id(),
+                event_time: burst.latest.event_time,
+                source: burst.latest.source,
                 severity: Severity::High,
                 rule: "repeated_login_failures",
                 actor,
-                ip_address,
+                ip_address: burst.ip_address,
+                occurrences: burst.count,
             }),
     );
 
@@ -606,6 +683,13 @@ mod tests {
         assert_eq!(findings[0].rule, "google_suspicious_login");
         assert_eq!(findings[0].actor, "user@wearenexa.com");
         assert_eq!(findings[0].ip_address.as_deref(), Some("203.0.113.10"));
+        assert_eq!(findings[0].event_id, "login:event-1:suspicious_login:0");
+        assert_eq!(
+            findings[0].event_time.as_deref(),
+            Some("2026-07-23T18:00:00.000Z")
+        );
+        assert_eq!(findings[0].source, "login");
+        assert_eq!(findings[0].occurrences, 1);
     }
 
     #[test]
@@ -692,7 +776,11 @@ mod tests {
         let activities: Vec<_> = (0..5)
             .map(|index| {
                 json!({
-                    "id": {"uniqueQualifier": index.to_string()},
+                    "id": {
+                        "time": format!("2026-07-23T18:00:0{index}.000Z"),
+                        "applicationName": "login",
+                        "uniqueQualifier": index.to_string()
+                    },
                     "actor": {"email": "user@wearenexa.com"},
                     "ipAddress": "203.0.113.20",
                     "events": [{"name": "login_failure"}]
@@ -706,6 +794,8 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].rule, "repeated_login_failures");
         assert_eq!(findings[0].actor, "user@wearenexa.com");
+        assert_eq!(findings[0].event_id, "login:4:repeated_login_failures");
+        assert_eq!(findings[0].occurrences, 5);
     }
 
     #[test]
@@ -759,18 +849,29 @@ mod tests {
     #[test]
     fn finding_serializes_as_stable_machine_readable_json() {
         let finding = Finding {
+            event_id: "login:event-30:account_disabled_password_leak:0".to_string(),
+            event_time: Some("2026-07-23T18:00:00.000Z".to_string()),
+            source: "login".to_string(),
             severity: Severity::Critical,
             rule: "password_leak",
             actor: "user@wearenexa.com".to_string(),
             ip_address: Some("203.0.113.30".to_string()),
+            occurrences: 1,
         };
 
         let value = serde_json::to_value(finding).expect("finding should serialize");
 
         assert_eq!(value["severity"], "critical");
+        assert_eq!(
+            value["eventId"],
+            "login:event-30:account_disabled_password_leak:0"
+        );
+        assert_eq!(value["eventTime"], "2026-07-23T18:00:00.000Z");
+        assert_eq!(value["source"], "login");
         assert_eq!(value["rule"], "password_leak");
         assert_eq!(value["actor"], "user@wearenexa.com");
         assert_eq!(value["ipAddress"], "203.0.113.30");
+        assert_eq!(value["occurrences"], 1);
     }
 
     #[test]
@@ -793,16 +894,24 @@ mod tests {
     fn critical_filter_excludes_high_findings() {
         let findings = vec![
             Finding {
+                event_id: "login:event-high:2sv_disable:0".to_string(),
+                event_time: None,
+                source: "login".to_string(),
                 severity: Severity::High,
                 rule: "two_step_verification_disabled",
                 actor: "user@wearenexa.com".to_string(),
                 ip_address: None,
+                occurrences: 1,
             },
             Finding {
+                event_id: "login:event-critical:account_disabled_password_leak:0".to_string(),
+                event_time: None,
+                source: "login".to_string(),
                 severity: Severity::Critical,
                 rule: "password_leak",
                 actor: "user@wearenexa.com".to_string(),
                 ip_address: None,
+                occurrences: 1,
             },
         ];
 

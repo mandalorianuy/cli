@@ -321,7 +321,7 @@ gws drive --help      # shows +upload …
 | `calendar` | `+insert` | Create a new event |
 | `calendar` | `+agenda` | Show upcoming events (uses Google account timezone; override with `--timezone`) |
 | `admin-reports` | `+admin-observer` | Read-only domain inventory for users, groups, OUs, roles, and domains |
-| `admin-reports` | `+security-observer` | Detect suspicious logins and sensitive admin or OAuth changes |
+| `admin-reports` | `+security-observer` | Detect identity, Drive sharing, bulk access, and DLP security signals |
 | `script` | `+push` | Replace all files in an Apps Script project with local files |
 | `workflow` | `+standup-report` | Today's meetings + open tasks as a standup summary |
 | `workflow` | `+meeting-prep` | Prepare for your next meeting: agenda, attendees, and linked docs |
@@ -361,8 +361,10 @@ gws calendar +agenda --today --timezone America/New_York
 # Read-only Workspace administration inventory
 gws admin-reports +admin-observer
 
-# Detect high and critical security events from the last 15 minutes
-gws admin-reports +security-observer
+# Detect high and critical identity, Drive, and DLP events
+gws admin-reports +security-observer \
+  --internal-domain example.com \
+  --trusted-domain approved-partner.example
 ```
 
 ### Model Armor (Response Sanitization)

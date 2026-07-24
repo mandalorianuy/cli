@@ -20,7 +20,7 @@ use chrono::{Duration, SecondsFormat, Utc};
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -72,11 +72,55 @@ struct Finding {
     event_id: String,
     event_time: Option<String>,
     source: String,
+    event_name: String,
     severity: Severity,
     rule: &'static str,
+    reason: &'static str,
     actor: String,
     ip_address: Option<String>,
     occurrences: usize,
+    evidence: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    originating_app_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct SecurityObserverConfig {
+    trusted_domains: HashSet<String>,
+    consumer_domains: HashSet<String>,
+    bulk_download_threshold: usize,
+    bulk_api_access_threshold: usize,
+    bulk_delete_threshold: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityTelemetry {
+    drive_document_types: BTreeMap<String, usize>,
+    drive_visibilities: BTreeMap<String, usize>,
+    originating_app_ids: BTreeMap<String, usize>,
+    external_target_domains: BTreeMap<String, usize>,
+    matched_dlp_detectors: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Recommendation {
+    recommendation_id: &'static str,
+    priority: &'static str,
+    category: &'static str,
+    title: &'static str,
+    rationale: String,
+    evidence_count: usize,
+    status: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +173,13 @@ struct FailedLoginBurst {
     latest: ActivityMetadata,
 }
 
+struct DriveBurst {
+    document_ids: HashSet<String>,
+    ip_address: Option<String>,
+    originating_app_id: Option<String>,
+    latest: ActivityMetadata,
+}
+
 fn event_bool_parameter(event: &Value, name: &str) -> bool {
     event
         .get("parameters")
@@ -139,6 +190,271 @@ fn event_bool_parameter(event: &Value, name: &str) -> bool {
         .and_then(|parameter| parameter.get("boolValue"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn event_string_parameter(event: &Value, name: &str) -> Option<String> {
+    event
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|parameter| parameter.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn event_string_values(event: &Value, name: &str) -> Vec<String> {
+    let Some(parameter) = event
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(name))
+    else {
+        return Vec::new();
+    };
+
+    let mut values = Vec::new();
+    if let Some(value) = parameter.get("value").and_then(Value::as_str) {
+        values.push(value.to_string());
+    }
+    if let Some(multi_values) = parameter.get("multiValue").and_then(Value::as_array) {
+        values.extend(
+            multi_values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    values
+}
+
+fn event_nested_parameter_values(
+    event: &Value,
+    parameter_name: &str,
+    nested_name: &str,
+) -> Vec<String> {
+    event
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(parameter_name))
+        .and_then(|parameter| parameter.get("multiMessageValue"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("parameter").and_then(Value::as_array))
+        .flatten()
+        .filter(|parameter| parameter.get("name").and_then(Value::as_str) == Some(nested_name))
+        .filter_map(|parameter| parameter.get("value").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn domain_from_target(target: &str) -> Option<String> {
+    let normalized = target.trim().trim_start_matches('@').to_ascii_lowercase();
+    let domain = normalized
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .unwrap_or(&normalized);
+    validate_domain(domain).ok()
+}
+
+fn validate_domain(value: &str) -> Result<String, String> {
+    let normalized = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 253 || !normalized.contains('.') {
+        return Err("domain must be a dotted DNS name no longer than 253 characters".to_string());
+    }
+    if !normalized.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("domain contains an invalid DNS label".to_string());
+    }
+    Ok(normalized)
+}
+
+fn is_public_visibility(value: Option<&str>) -> bool {
+    matches!(value, Some("people_with_link" | "public_on_the_web"))
+}
+
+fn is_access_grant(value: Option<&str>) -> bool {
+    !matches!(value, None | Some("none"))
+}
+
+fn increment(map: &mut BTreeMap<String, usize>, key: Option<String>) {
+    if let Some(key) = key.filter(|value| !value.is_empty()) {
+        *map.entry(key).or_default() += 1;
+    }
+}
+
+fn finding_from_event(
+    metadata: &ActivityMetadata,
+    event_name: &str,
+    event_index: usize,
+    event: &Value,
+    severity: Severity,
+    rule: &'static str,
+    principal: (String, Option<String>),
+) -> Finding {
+    let mut evidence = BTreeMap::new();
+    for name in [
+        "affected_email_address",
+        "api_method",
+        "api_name",
+        "app_name",
+        "client_id",
+        "client_type",
+        "data_source",
+        "doc_type",
+        "is_suspicious",
+        "login_challenge_method",
+        "login_type",
+        "matched_trigger",
+        "new_value",
+        "old_value",
+        "originating_app_id",
+        "owner",
+        "resource_type",
+        "rule_name",
+        "rule_type",
+        "scan_type",
+        "scope",
+        "severity",
+        "target",
+        "target_domain",
+        "target_user",
+        "visibility",
+        "visibility_change",
+    ] {
+        let values = event_string_values(event, name);
+        if !values.is_empty() {
+            evidence.insert(name.to_string(), values.join(", "));
+        } else if event_bool_parameter(event, name) {
+            evidence.insert(name.to_string(), "true".to_string());
+        }
+    }
+    let matched_detectors =
+        event_nested_parameter_values(event, "matched_detectors", "display_name");
+    if !matched_detectors.is_empty() {
+        evidence.insert(
+            "matched_detectors".to_string(),
+            matched_detectors.join(", "),
+        );
+    }
+
+    Finding {
+        event_id: metadata.event_id(event_name, event_index),
+        event_time: metadata.event_time.clone(),
+        source: metadata.source.clone(),
+        event_name: event_name.to_string(),
+        severity,
+        rule,
+        reason: reason_for_rule(rule),
+        actor: principal.0,
+        ip_address: principal.1,
+        occurrences: 1,
+        evidence,
+        target: event_string_parameter(event, "target_user")
+            .or_else(|| event_string_parameter(event, "target"))
+            .or_else(|| event_string_parameter(event, "target_domain")),
+        resource_id: event_string_parameter(event, "doc_id")
+            .or_else(|| event_string_parameter(event, "resource_id")),
+        resource_type: event_string_parameter(event, "doc_type")
+            .or_else(|| event_string_parameter(event, "resource_type")),
+        visibility: event_string_parameter(event, "visibility").or_else(|| {
+            event_string_parameter(event, "new_value").filter(|value| {
+                matches!(
+                    value.as_str(),
+                    "people_with_link"
+                        | "people_within_domain_with_link"
+                        | "private"
+                        | "public_in_the_domain"
+                        | "public_on_the_web"
+                )
+            })
+        }),
+        originating_app_id: event_string_parameter(event, "originating_app_id"),
+    }
+}
+
+fn reason_for_rule(rule: &str) -> &'static str {
+    match rule {
+        "google_suspicious_login" => "Google explicitly detected and blocked a suspicious login.",
+        "suspicious_less_secure_app" => {
+            "Google detected a suspicious login from a less secure application."
+        }
+        "suspicious_programmatic_login" => {
+            "Google detected suspicious programmatic authentication."
+        }
+        "suspicious_session_cookie" => {
+            "Google signed the user out after detecting a suspicious session cookie."
+        }
+        "password_leak" => "Google disabled the account after detecting a leaked password.",
+        "account_hijacked" => "Google disabled the account after detecting possible hijacking.",
+        "government_backed_attack_warning" => {
+            "Google warned that the account may be targeted by a government-backed attacker."
+        }
+        "google_ransomware_sync_pause" => {
+            "Google paused Drive sync after detecting potential ransomware behavior."
+        }
+        "suspicious_successful_login" => {
+            "Google marked a successful login as suspicious due to unusual characteristics."
+        }
+        "two_step_verification_disabled" => "Two-step verification was disabled for the account.",
+        "passkey_removed" => "A passkey was removed from the account.",
+        "recovery_email_changed" => "The account recovery email was changed.",
+        "recovery_phone_changed" => "The account recovery phone was changed.",
+        "admin_role_assigned" => "An administrator role was assigned.",
+        "domain_wide_delegation_authorized" => {
+            "A client was authorized for domain-wide delegation."
+        }
+        "context_aware_access_changed" => "Context-Aware Access assignments were changed.",
+        "oauth_application_authorized" => {
+            "A user authorized an OAuth application; app, client, and scopes require review."
+        }
+        "drive_public_link_enabled" => {
+            "Drive link visibility changed to anyone with the link or public on the web."
+        }
+        "drive_shared_with_consumer_account" => {
+            "A Drive item was shared with an account on a consumer email domain."
+        }
+        "drive_shared_outside_trusted_domains" => {
+            "A Drive item was shared outside the configured trusted domains."
+        }
+        "drive_external_ownership_transfer" => {
+            "Ownership of a Drive item was transferred outside the configured trusted domains."
+        }
+        "drive_emailed_to_consumer_account" => {
+            "A Drive item was emailed as an attachment to a consumer account."
+        }
+        "drive_emailed_outside_trusted_domains" => {
+            "A Drive item was emailed as an attachment outside trusted domains."
+        }
+        "dlp_content_match" => "An existing Workspace DLP rule matched content.",
+        "dlp_rule_triggered" => "An existing Workspace DLP rule was triggered.",
+        "dlp_user_warned" => "A user received a DLP warning while sending content.",
+        "repeated_login_failures" => {
+            "The account reached the failed-login threshold during the observation window."
+        }
+        "bulk_drive_download" => {
+            "The actor downloaded at least the configured number of unique Drive items."
+        }
+        "bulk_drive_api_access" => {
+            "The actor or application accessed at least the configured number of unique Drive items."
+        }
+        "bulk_drive_delete" => {
+            "The actor deleted or trashed at least the configured number of unique Drive items."
+        }
+        _ => "The observed event matched a configured security rule.",
+    }
 }
 
 fn activities_from_response(response: &Value) -> (Vec<Value>, Option<String>) {
@@ -154,9 +470,16 @@ fn activities_from_response(response: &Value) -> (Vec<Value>, Option<String>) {
     (activities, next_page)
 }
 
-fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
+fn analyze_activities(
+    activities: &[Value],
+    config: &SecurityObserverConfig,
+) -> (Vec<Finding>, SecurityTelemetry) {
     let mut findings = Vec::new();
     let mut failed_logins: HashMap<String, FailedLoginBurst> = HashMap::new();
+    let mut download_bursts: HashMap<String, DriveBurst> = HashMap::new();
+    let mut api_access_bursts: HashMap<String, DriveBurst> = HashMap::new();
+    let mut delete_bursts: HashMap<String, DriveBurst> = HashMap::new();
+    let mut telemetry = SecurityTelemetry::default();
 
     for activity in activities {
         let metadata = ActivityMetadata::from_activity(activity);
@@ -180,15 +503,74 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
             let Some(event_name) = event.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            let resource_owner = event_string_parameter(event, "resource_owner_email");
+            let effective_actor = if actor == "(unknown)" {
+                resource_owner.unwrap_or_else(|| actor.clone())
+            } else {
+                actor.clone()
+            };
+            let doc_id = event_string_parameter(event, "doc_id")
+                .or_else(|| event_string_parameter(event, "resource_id"))
+                .unwrap_or_else(|| metadata.event_id(event_name, event_index));
+            let originating_app_id = event_string_parameter(event, "originating_app_id");
+
+            if metadata.source == "drive" {
+                increment(
+                    &mut telemetry.drive_document_types,
+                    event_string_parameter(event, "doc_type"),
+                );
+                increment(
+                    &mut telemetry.drive_visibilities,
+                    event_string_parameter(event, "visibility"),
+                );
+                increment(
+                    &mut telemetry.originating_app_ids,
+                    originating_app_id.clone(),
+                );
+            }
+            if metadata.source == "rules" {
+                for detector in
+                    event_nested_parameter_values(event, "matched_detectors", "display_name")
+                {
+                    increment(&mut telemetry.matched_dlp_detectors, Some(detector));
+                }
+            }
+
+            let target = event_string_parameter(event, "target_user")
+                .or_else(|| event_string_parameter(event, "target"));
+            let target_domain = target.as_deref().and_then(domain_from_target).or_else(|| {
+                event_string_parameter(event, "target_domain")
+                    .and_then(|value| domain_from_target(&value))
+            });
+            let target_is_consumer = target_domain
+                .as_ref()
+                .is_some_and(|domain| config.consumer_domains.contains(domain));
+            let target_is_untrusted = target_domain
+                .as_ref()
+                .is_some_and(|domain| !config.trusted_domains.contains(domain));
+            let became_external =
+                event_string_parameter(event, "visibility_change").as_deref() == Some("external");
+            let permission_value = event_string_parameter(event, "new_value");
+            let permission_granted = is_access_grant(permission_value.as_deref());
+            let untrusted_external_change = target_domain
+                .as_ref()
+                .map(|_| target_is_untrusted)
+                .unwrap_or(became_external);
+            if metadata.source == "drive" && permission_granted && target_is_untrusted {
+                increment(
+                    &mut telemetry.external_target_domains,
+                    target_domain.clone(),
+                );
+            }
+
             if event_name == "login_failure" {
-                let entry =
-                    failed_logins
-                        .entry(actor.clone())
-                        .or_insert_with(|| FailedLoginBurst {
-                            count: 0,
-                            ip_address: ip_address.clone(),
-                            latest: metadata.clone(),
-                        });
+                let entry = failed_logins
+                    .entry(effective_actor.clone())
+                    .or_insert_with(|| FailedLoginBurst {
+                        count: 0,
+                        ip_address: ip_address.clone(),
+                        latest: metadata.clone(),
+                    });
                 entry.count += 1;
                 if metadata.is_later_than(&entry.latest) {
                     entry.latest = metadata.clone();
@@ -196,6 +578,36 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
                 }
                 continue;
             }
+
+            let burst_key = format!(
+                "{}\u{1f}{}\u{1f}{}",
+                effective_actor,
+                ip_address.as_deref().unwrap_or(""),
+                originating_app_id.as_deref().unwrap_or("")
+            );
+            let burst_map = match event_name {
+                "download" | "download_forms_response" => Some(&mut download_bursts),
+                "access_item_content" | "prefetch_item_content" | "sync_item_content" => {
+                    Some(&mut api_access_bursts)
+                }
+                "delete" | "trash" | "delete_revision" => Some(&mut delete_bursts),
+                _ => None,
+            };
+            if let Some(bursts) = burst_map {
+                let entry = bursts.entry(burst_key).or_insert_with(|| DriveBurst {
+                    document_ids: HashSet::new(),
+                    ip_address: ip_address.clone(),
+                    originating_app_id: originating_app_id.clone(),
+                    latest: metadata.clone(),
+                });
+                entry.document_ids.insert(doc_id);
+                if metadata.is_later_than(&entry.latest) {
+                    entry.latest = metadata.clone();
+                    entry.ip_address = ip_address.clone();
+                    entry.originating_app_id = originating_app_id.clone();
+                }
+            }
+
             let critical_rule = match event_name {
                 "suspicious_login" => Some("google_suspicious_login"),
                 "suspicious_login_less_secure_app" => Some("suspicious_less_secure_app"),
@@ -205,22 +617,36 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
                 }
                 "account_disabled_password_leak" => Some("password_leak"),
                 "account_disabled_hijacked" => Some("account_hijacked"),
+                "gov_attack_warning" => Some("government_backed_attack_warning"),
+                "pause_sync_client" => Some("google_ransomware_sync_pause"),
                 "ASSIGN_ROLE" => Some("admin_role_assigned"),
                 "AUTHORIZE_API_CLIENT_ACCESS" => Some("domain_wide_delegation_authorized"),
+                "change_document_visibility"
+                    if is_public_visibility(
+                        event_string_parameter(event, "new_value").as_deref(),
+                    ) =>
+                {
+                    Some("drive_public_link_enabled")
+                }
+                "change_user_access"
+                    if permission_value.as_deref() == Some("owner")
+                        && untrusted_external_change =>
+                {
+                    Some("drive_external_ownership_transfer")
+                }
                 _ => None,
             };
 
             if let Some(rule) = critical_rule {
-                findings.push(Finding {
-                    event_id: metadata.event_id(event_name, event_index),
-                    event_time: metadata.event_time.clone(),
-                    source: metadata.source.clone(),
-                    severity: Severity::Critical,
+                findings.push(finding_from_event(
+                    &metadata,
+                    event_name,
+                    event_index,
+                    event,
+                    Severity::Critical,
                     rule,
-                    actor: actor.clone(),
-                    ip_address: ip_address.clone(),
-                    occurrences: 1,
-                });
+                    (effective_actor, ip_address.clone()),
+                ));
                 continue;
             }
 
@@ -234,20 +660,43 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
                 "recovery_phone_edit" => Some("recovery_phone_changed"),
                 "CHANGE_CAA_APP_ASSIGNMENTS" => Some("context_aware_access_changed"),
                 "authorize" => Some("oauth_application_authorized"),
+                "change_user_access" if permission_granted && target_is_consumer => {
+                    Some("drive_shared_with_consumer_account")
+                }
+                "change_user_access" if permission_granted && untrusted_external_change => {
+                    Some("drive_shared_outside_trusted_domains")
+                }
+                "email_as_attachment" if target_is_consumer => {
+                    Some("drive_emailed_to_consumer_account")
+                }
+                "email_as_attachment" if target_is_untrusted => {
+                    Some("drive_emailed_outside_trusted_domains")
+                }
+                "content_matched" | "rule_match"
+                    if event_string_parameter(event, "rule_type").as_deref() == Some("DLP")
+                        || event_name == "content_matched" =>
+                {
+                    Some("dlp_content_match")
+                }
+                "rule_trigger"
+                    if event_string_parameter(event, "rule_type").as_deref() == Some("DLP") =>
+                {
+                    Some("dlp_rule_triggered")
+                }
+                "message_send_warned" => Some("dlp_user_warned"),
                 _ => None,
             };
 
             if let Some(rule) = high_rule {
-                findings.push(Finding {
-                    event_id: metadata.event_id(event_name, event_index),
-                    event_time: metadata.event_time.clone(),
-                    source: metadata.source.clone(),
-                    severity: Severity::High,
+                findings.push(finding_from_event(
+                    &metadata,
+                    event_name,
+                    event_index,
+                    event,
+                    Severity::High,
                     rule,
-                    actor: actor.clone(),
-                    ip_address: ip_address.clone(),
-                    occurrences: 1,
-                });
+                    (effective_actor, ip_address.clone()),
+                ));
             }
         }
     }
@@ -260,15 +709,223 @@ fn analyze_activities(activities: &[Value]) -> Vec<Finding> {
                 event_id: burst.latest.burst_event_id(),
                 event_time: burst.latest.event_time,
                 source: burst.latest.source,
+                event_name: "login_failure_aggregate".to_string(),
                 severity: Severity::High,
                 rule: "repeated_login_failures",
+                reason: reason_for_rule("repeated_login_failures"),
                 actor,
                 ip_address: burst.ip_address,
                 occurrences: burst.count,
+                evidence: BTreeMap::from([(
+                    "failed_login_count".to_string(),
+                    burst.count.to_string(),
+                )]),
+                target: None,
+                resource_id: None,
+                resource_type: None,
+                visibility: None,
+                originating_app_id: None,
             }),
     );
 
-    findings
+    findings.extend(drive_burst_findings(
+        download_bursts,
+        config.bulk_download_threshold,
+        "bulk_drive_download",
+    ));
+    findings.extend(drive_burst_findings(
+        api_access_bursts,
+        config.bulk_api_access_threshold,
+        "bulk_drive_api_access",
+    ));
+    findings.extend(drive_burst_findings(
+        delete_bursts,
+        config.bulk_delete_threshold,
+        "bulk_drive_delete",
+    ));
+    findings.sort_by(|left, right| {
+        left.event_time
+            .cmp(&right.event_time)
+            .then_with(|| left.rule.cmp(right.rule))
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+
+    (findings, telemetry)
+}
+
+fn drive_burst_findings(
+    bursts: HashMap<String, DriveBurst>,
+    threshold: usize,
+    rule: &'static str,
+) -> Vec<Finding> {
+    bursts
+        .into_iter()
+        .filter(|(_, burst)| burst.document_ids.len() >= threshold)
+        .map(|(key, burst)| Finding {
+            event_id: format!("{}:{}:{rule}", burst.latest.source, burst.latest.qualifier),
+            event_time: burst.latest.event_time,
+            source: burst.latest.source,
+            event_name: "drive_activity_aggregate".to_string(),
+            severity: Severity::High,
+            rule,
+            reason: reason_for_rule(rule),
+            actor: key
+                .split('\u{1f}')
+                .next()
+                .unwrap_or("(unknown)")
+                .to_string(),
+            ip_address: burst.ip_address,
+            occurrences: burst.document_ids.len(),
+            evidence: BTreeMap::from([(
+                "unique_resource_count".to_string(),
+                burst.document_ids.len().to_string(),
+            )]),
+            target: None,
+            resource_id: None,
+            resource_type: None,
+            visibility: None,
+            originating_app_id: burst.originating_app_id,
+        })
+        .collect()
+}
+
+fn build_recommendations(
+    findings: &[Finding],
+    telemetry: &SecurityTelemetry,
+) -> Vec<Recommendation> {
+    let count_rule = |rule: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding.rule == rule)
+            .count()
+    };
+    let mut recommendations = vec![
+        Recommendation {
+            recommendation_id: "dlp-audit-sensitive-data-types",
+            priority: "medium",
+            category: "dlp",
+            title: "Baseline sensitive data with audit-only DLP detectors",
+            rationale: "Start with audit-only predefined detectors for financial identifiers, government IDs, tax IDs, credentials, email addresses, and phone numbers; tune confidence and match counts before enforcement.".to_string(),
+            evidence_count: telemetry.matched_dlp_detectors.values().sum(),
+            status: "proposed",
+        },
+        Recommendation {
+            recommendation_id: "drive-label-classification-taxonomy",
+            priority: "medium",
+            category: "classification",
+            title: "Define a Drive classification label taxonomy",
+            rationale: "Use a small taxonomy such as Public, Internal, Confidential, and Restricted so later DLP and sharing rules can combine content matches with business context.".to_string(),
+            evidence_count: telemetry.drive_document_types.values().sum(),
+            status: "proposed",
+        },
+    ];
+
+    let public_links = count_rule("drive_public_link_enabled");
+    if public_links > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "drive-public-link-governance",
+            priority: "critical",
+            category: "sharing",
+            title: "Restrict public link sharing",
+            rationale: "Review public-link findings, identify legitimate publishing workflows, then limit public links by OU/group and use exceptions instead of a domain-wide allowance.".to_string(),
+            evidence_count: public_links,
+            status: "proposed",
+        });
+    }
+
+    let consumer_shares = count_rule("drive_shared_with_consumer_account")
+        + count_rule("drive_emailed_to_consumer_account");
+    if consumer_shares > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "consumer-account-sharing-policy",
+            priority: "high",
+            category: "sharing",
+            title: "Govern sharing to consumer accounts",
+            rationale: "Review whether consumer-account recipients are approved business exceptions; use trusted-domain allowlists and audit-only DLP rules before blocking.".to_string(),
+            evidence_count: consumer_shares,
+            status: "proposed",
+        });
+    }
+
+    let bulk_downloads = count_rule("bulk_drive_download");
+    if bulk_downloads > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "bulk-download-controls",
+            priority: "high",
+            category: "behavior",
+            title: "Protect sensitive files from bulk download",
+            rationale: "Baseline expected export and migration tooling, then apply labels, download/copy restrictions, and alert thresholds to sensitive repositories.".to_string(),
+            evidence_count: bulk_downloads,
+            status: "proposed",
+        });
+    }
+
+    let bulk_api_access = count_rule("bulk_drive_api_access");
+    if bulk_api_access > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "drive-api-tooling-baseline",
+            priority: "high",
+            category: "tooling",
+            title: "Baseline and allowlist high-volume Drive tooling",
+            rationale: "Map originating Google Cloud project IDs to approved tools, owners, expected volumes, and change windows; investigate high-volume access outside that baseline.".to_string(),
+            evidence_count: bulk_api_access,
+            status: "proposed",
+        });
+    }
+
+    let dlp_matches = count_rule("dlp_content_match") + count_rule("dlp_rule_triggered");
+    if dlp_matches > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "dlp-match-tuning",
+            priority: "high",
+            category: "dlp",
+            title: "Review and tune existing DLP detector matches",
+            rationale: "Use matched detector counts to measure precision, document false positives, and promote only stable audit rules to warn or block.".to_string(),
+            evidence_count: dlp_matches,
+            status: "proposed",
+        });
+    }
+
+    let externally_visible_observations = telemetry
+        .drive_visibilities
+        .get("shared_externally")
+        .copied()
+        .unwrap_or_default();
+    if externally_visible_observations > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "drive-external-sharing-inventory",
+            priority: "high",
+            category: "sharing",
+            title: "Build a current inventory of externally visible Drive resources",
+            rationale: "Use unique resource IDs and current ACL state to separate approved collaboration from stale or excessive exposure before introducing restrictions. Telemetry counts audit observations, not unique files.".to_string(),
+            evidence_count: externally_visible_observations,
+            status: "proposed",
+        });
+    }
+
+    let public_link_observations = telemetry
+        .drive_visibilities
+        .get("people_with_link")
+        .copied()
+        .unwrap_or_default()
+        + telemetry
+            .drive_visibilities
+            .get("public_on_the_web")
+            .copied()
+            .unwrap_or_default();
+    if public_link_observations > 0 {
+        recommendations.push(Recommendation {
+            recommendation_id: "drive-public-link-inventory",
+            priority: "high",
+            category: "sharing",
+            title: "Review active resources observed with public-link visibility",
+            rationale: "Confirm business purpose and ownership for public-link resources, then restrict public links by OU or group with documented exceptions. Telemetry counts audit observations, not unique files.".to_string(),
+            evidence_count: public_link_observations,
+            status: "proposed",
+        });
+    }
+
+    recommendations
 }
 
 fn filter_findings(findings: Vec<Finding>, min_severity: &str) -> Vec<Finding> {
@@ -307,6 +964,51 @@ fn build_security_observer_cmd() -> Command {
                 .value_name("LEVEL"),
         )
         .arg(
+            Arg::new("internal-domain")
+                .long("internal-domain")
+                .action(ArgAction::Append)
+                .value_parser(validate_domain)
+                .value_name("DOMAIN")
+                .help("Internal Workspace domain; repeat for aliases"),
+        )
+        .arg(
+            Arg::new("trusted-domain")
+                .long("trusted-domain")
+                .action(ArgAction::Append)
+                .value_parser(validate_domain)
+                .value_name("DOMAIN")
+                .help("Approved external sharing domain; repeat as needed"),
+        )
+        .arg(
+            Arg::new("consumer-domain")
+                .long("consumer-domain")
+                .action(ArgAction::Append)
+                .value_parser(validate_domain)
+                .value_name("DOMAIN")
+                .help("Additional consumer email domain to flag"),
+        )
+        .arg(
+            Arg::new("bulk-download-threshold")
+                .long("bulk-download-threshold")
+                .value_parser(value_parser!(u32).range(5..=1_000))
+                .default_value("25")
+                .value_name("UNIQUE_FILES"),
+        )
+        .arg(
+            Arg::new("bulk-api-access-threshold")
+                .long("bulk-api-access-threshold")
+                .value_parser(value_parser!(u32).range(5..=1_000))
+                .default_value("100")
+                .value_name("UNIQUE_FILES"),
+        )
+        .arg(
+            Arg::new("bulk-delete-threshold")
+                .long("bulk-delete-threshold")
+                .value_parser(value_parser!(u32).range(5..=1_000))
+                .default_value("50")
+                .value_name("UNIQUE_FILES"),
+        )
+        .arg(
             Arg::new("format")
                 .long("format")
                 .value_parser(["json", "table", "yaml", "csv"])
@@ -316,6 +1018,61 @@ fn build_security_observer_cmd() -> Command {
         .after_help(
             "READ-ONLY GUARANTEE:\n  Uses only Admin Reports API GET requests.\n  Never suspends users, revokes tokens, changes 2SV, or modifies devices.",
         )
+}
+
+fn security_observer_config(matches: &ArgMatches) -> SecurityObserverConfig {
+    let mut trusted_domains: HashSet<String> = matches
+        .get_many::<String>("internal-domain")
+        .into_iter()
+        .flatten()
+        .chain(
+            matches
+                .get_many::<String>("trusted-domain")
+                .into_iter()
+                .flatten(),
+        )
+        .cloned()
+        .collect();
+    trusted_domains.shrink_to_fit();
+
+    let mut consumer_domains: HashSet<String> = [
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "yahoo.com",
+        "icloud.com",
+        "proton.me",
+        "protonmail.com",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    consumer_domains.extend(
+        matches
+            .get_many::<String>("consumer-domain")
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+
+    SecurityObserverConfig {
+        trusted_domains,
+        consumer_domains,
+        bulk_download_threshold: matches
+            .get_one::<u32>("bulk-download-threshold")
+            .copied()
+            .unwrap_or(25) as usize,
+        bulk_api_access_threshold: matches
+            .get_one::<u32>("bulk-api-access-threshold")
+            .copied()
+            .unwrap_or(100) as usize,
+        bulk_delete_threshold: matches
+            .get_one::<u32>("bulk-delete-threshold")
+            .copied()
+            .unwrap_or(50) as usize,
+    }
 }
 
 fn build_admin_observer_cmd() -> Command {
@@ -340,7 +1097,7 @@ fn build_admin_observer_cmd() -> Command {
 }
 
 fn security_observer_requests(start_time: &str, max_results: u32) -> Vec<ObserverRequest> {
-    ["login", "admin", "token"]
+    ["login", "admin", "token", "drive", "rules"]
         .into_iter()
         .map(|application_name| ObserverRequest {
             application_name,
@@ -567,6 +1324,7 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         .get_one::<String>("format")
         .map(String::as_str)
         .unwrap_or("json");
+    let config = security_observer_config(matches);
 
     let end_time = Utc::now();
     let start_time = end_time - Duration::minutes(lookback_minutes as i64);
@@ -585,7 +1343,9 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
     }
 
     let activity_count = activities.len();
-    let findings = filter_findings(analyze_activities(&activities), min_severity);
+    let (findings, telemetry) = analyze_activities(&activities, &config);
+    let findings = filter_findings(findings, min_severity);
+    let recommendations = build_recommendations(&findings, &telemetry);
     let report = json!({
         "mode": "read-only",
         "window": {
@@ -600,6 +1360,9 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         "activitiesAnalyzed": activity_count,
         "findingCount": findings.len(),
         "findings": findings,
+        "telemetry": telemetry,
+        "recommendationCount": recommendations.len(),
+        "recommendations": recommendations,
     });
     let format = crate::formatter::OutputFormat::parse(output_format)
         .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
@@ -643,6 +1406,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_config() -> SecurityObserverConfig {
+        SecurityObserverConfig {
+            trusted_domains: HashSet::from(["wearenexa.com".to_string()]),
+            consumer_domains: HashSet::from(["gmail.com".to_string(), "outlook.com".to_string()]),
+            bulk_download_threshold: 5,
+            bulk_api_access_threshold: 5,
+            bulk_delete_threshold: 5,
+        }
+    }
+
+    fn test_analyze(activities: &[Value]) -> Vec<Finding> {
+        analyze_activities(activities, &test_config()).0
+    }
+
     #[test]
     fn injects_admin_and_security_observer_commands() {
         let helper = AdminHelper;
@@ -676,7 +1453,7 @@ mod tests {
             }]
         })];
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
@@ -714,7 +1491,7 @@ mod tests {
             })
             .collect();
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), event_names.len());
         assert!(findings
@@ -750,7 +1527,7 @@ mod tests {
             }),
         ];
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), activities.len());
         assert!(findings
@@ -768,7 +1545,7 @@ mod tests {
             }]
         })];
 
-        assert!(analyze_activities(&activities).is_empty());
+        assert!(test_analyze(&activities).is_empty());
     }
 
     #[test]
@@ -788,7 +1565,7 @@ mod tests {
             })
             .collect();
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
@@ -827,13 +1604,13 @@ mod tests {
     fn security_observer_plan_contains_only_reports_get_requests() {
         let requests = security_observer_requests("2026-07-23T18:00:00Z", 100);
 
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 5);
         assert_eq!(
             requests
                 .iter()
                 .map(|request| request.application_name)
                 .collect::<Vec<_>>(),
-            ["login", "admin", "token"]
+            ["login", "admin", "token", "drive", "rules"]
         );
         assert!(requests
             .iter()
@@ -852,11 +1629,19 @@ mod tests {
             event_id: "login:event-30:account_disabled_password_leak:0".to_string(),
             event_time: Some("2026-07-23T18:00:00.000Z".to_string()),
             source: "login".to_string(),
+            event_name: "account_disabled_password_leak".to_string(),
             severity: Severity::Critical,
             rule: "password_leak",
+            reason: reason_for_rule("password_leak"),
             actor: "user@wearenexa.com".to_string(),
             ip_address: Some("203.0.113.30".to_string()),
             occurrences: 1,
+            evidence: BTreeMap::new(),
+            target: None,
+            resource_id: None,
+            resource_type: None,
+            visibility: None,
+            originating_app_id: None,
         };
 
         let value = serde_json::to_value(finding).expect("finding should serialize");
@@ -897,21 +1682,37 @@ mod tests {
                 event_id: "login:event-high:2sv_disable:0".to_string(),
                 event_time: None,
                 source: "login".to_string(),
+                event_name: "2sv_disable".to_string(),
                 severity: Severity::High,
                 rule: "two_step_verification_disabled",
+                reason: reason_for_rule("two_step_verification_disabled"),
                 actor: "user@wearenexa.com".to_string(),
                 ip_address: None,
                 occurrences: 1,
+                evidence: BTreeMap::new(),
+                target: None,
+                resource_id: None,
+                resource_type: None,
+                visibility: None,
+                originating_app_id: None,
             },
             Finding {
                 event_id: "login:event-critical:account_disabled_password_leak:0".to_string(),
                 event_time: None,
                 source: "login".to_string(),
+                event_name: "account_disabled_password_leak".to_string(),
                 severity: Severity::Critical,
                 rule: "password_leak",
+                reason: reason_for_rule("password_leak"),
                 actor: "user@wearenexa.com".to_string(),
                 ip_address: None,
                 occurrences: 1,
+                evidence: BTreeMap::new(),
+                target: None,
+                resource_id: None,
+                resource_type: None,
+                visibility: None,
+                originating_app_id: None,
             },
         ];
 
@@ -994,7 +1795,7 @@ mod tests {
             }),
         ];
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), 2);
         assert!(findings
@@ -1017,10 +1818,243 @@ mod tests {
             }]
         })];
 
-        let findings = analyze_activities(&activities);
+        let findings = test_analyze(&activities);
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].rule, "oauth_application_authorized");
+        assert_eq!(findings[0].event_name, "authorize");
+        assert_eq!(
+            findings[0].evidence.get("app_name").map(String::as_str),
+            Some("Unfamiliar App")
+        );
+        assert!(findings[0].reason.contains("client"));
+    }
+
+    #[test]
+    fn public_link_and_external_ownership_are_critical() {
+        let activities = vec![
+            json!({
+                "id": {"applicationName": "drive", "uniqueQualifier": "public-link"},
+                "actor": {"email": "user@wearenexa.com"},
+                "events": [{
+                    "name": "change_document_visibility",
+                    "parameters": [
+                        {"name": "doc_id", "value": "doc-public"},
+                        {"name": "doc_type", "value": "spreadsheet"},
+                        {"name": "new_value", "value": "people_with_link"}
+                    ]
+                }]
+            }),
+            json!({
+                "id": {"applicationName": "drive", "uniqueQualifier": "owner-transfer"},
+                "actor": {"email": "user@wearenexa.com"},
+                "events": [{
+                    "name": "change_user_access",
+                    "parameters": [
+                        {"name": "doc_id", "value": "doc-owned"},
+                        {"name": "target_user", "value": "personal@gmail.com"},
+                        {"name": "new_value", "value": "owner"},
+                        {"name": "visibility_change", "value": "external"}
+                    ]
+                }]
+            }),
+        ];
+
+        let findings = test_analyze(&activities);
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity == Severity::Critical));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule == "drive_public_link_enabled"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule == "drive_external_ownership_transfer"));
+    }
+
+    #[test]
+    fn consumer_share_is_high_and_trusted_external_share_is_not_flagged() {
+        let activities = vec![
+            json!({
+                "id": {"applicationName": "drive", "uniqueQualifier": "consumer"},
+                "actor": {"email": "user@wearenexa.com"},
+                "events": [{
+                    "name": "change_user_access",
+                    "parameters": [
+                        {"name": "target_user", "value": "person@gmail.com"},
+                        {"name": "new_value", "value": "can_view"},
+                        {"name": "visibility_change", "value": "external"}
+                    ]
+                }]
+            }),
+            json!({
+                "id": {"applicationName": "drive", "uniqueQualifier": "partner"},
+                "actor": {"email": "user@wearenexa.com"},
+                "events": [{
+                    "name": "change_user_access",
+                    "parameters": [
+                        {"name": "target_user", "value": "partner@approved.example"},
+                        {"name": "new_value", "value": "can_view"},
+                        {"name": "visibility_change", "value": "external"}
+                    ]
+                }]
+            }),
+        ];
+        let mut config = test_config();
+        config
+            .trusted_domains
+            .insert("approved.example".to_string());
+
+        let findings = analyze_activities(&activities, &config).0;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "drive_shared_with_consumer_account");
+        assert_eq!(findings[0].target.as_deref(), Some("person@gmail.com"));
+    }
+
+    #[test]
+    fn bulk_download_counts_unique_documents() {
+        let activities: Vec<_> = (0..5)
+            .map(|index| {
+                json!({
+                    "id": {
+                        "time": format!("2026-07-23T18:00:0{index}.000Z"),
+                        "applicationName": "drive",
+                        "uniqueQualifier": index.to_string()
+                    },
+                    "actor": {"email": "user@wearenexa.com"},
+                    "ipAddress": "203.0.113.40",
+                    "events": [{
+                        "name": "download",
+                        "parameters": [
+                            {"name": "doc_id", "value": format!("doc-{index}")},
+                            {"name": "originating_app_id", "value": "cloud-project-1"}
+                        ]
+                    }]
+                })
+            })
+            .collect();
+
+        let findings = test_analyze(&activities);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "bulk_drive_download");
+        assert_eq!(findings[0].occurrences, 5);
+        assert_eq!(
+            findings[0].originating_app_id.as_deref(),
+            Some("cloud-project-1")
+        );
+        assert_eq!(
+            findings[0]
+                .evidence
+                .get("unique_resource_count")
+                .map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn dlp_match_exposes_detector_evidence_without_resource_title() {
+        let activities = vec![json!({
+            "id": {"applicationName": "rules", "uniqueQualifier": "dlp-1"},
+            "events": [{
+                "name": "content_matched",
+                "parameters": [
+                    {"name": "rule_type", "value": "DLP"},
+                    {"name": "rule_name", "value": "Financial data audit"},
+                    {"name": "resource_owner_email", "value": "owner@wearenexa.com"},
+                    {"name": "resource_id", "value": "resource-1"},
+                    {"name": "resource_title", "value": "Sensitive title must not be retained"},
+                    {"name": "matched_detectors", "multiMessageValue": [{
+                        "parameter": [
+                            {"name": "detector_id", "value": "detector-1"},
+                            {"name": "display_name", "value": "Credit card number"}
+                        ]
+                    }]}
+                ]
+            }]
+        })];
+
+        let (findings, telemetry) = analyze_activities(&activities, &test_config());
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "dlp_content_match");
+        assert_eq!(findings[0].actor, "owner@wearenexa.com");
+        assert_eq!(
+            findings[0]
+                .evidence
+                .get("matched_detectors")
+                .map(String::as_str),
+            Some("Credit card number")
+        );
+        assert!(!findings[0].evidence.contains_key("resource_title"));
+        assert_eq!(
+            telemetry
+                .matched_dlp_detectors
+                .get("Credit card number")
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn domain_flags_are_normalized_and_reject_unsafe_values() {
+        assert_eq!(
+            validate_domain("@WeAreNexa.COM").as_deref(),
+            Ok("wearenexa.com")
+        );
+        for invalid in ["wearenexa", "-bad.example", "bad..example", "bad/example"] {
+            assert!(validate_domain(invalid).is_err(), "{invalid} should fail");
+        }
+
+        assert!(build_security_observer_cmd()
+            .try_get_matches_from([
+                "+security-observer",
+                "--internal-domain",
+                "wearenexa.com",
+                "--trusted-domain",
+                "partner.example",
+            ])
+            .is_ok());
+        assert!(build_security_observer_cmd()
+            .try_get_matches_from([
+                "+security-observer",
+                "--internal-domain",
+                "bad/../../domain",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn visibility_telemetry_creates_inventory_recommendations_without_claiming_unique_files() {
+        let telemetry = SecurityTelemetry {
+            drive_visibilities: BTreeMap::from([
+                ("shared_externally".to_string(), 12),
+                ("people_with_link".to_string(), 3),
+            ]),
+            ..SecurityTelemetry::default()
+        };
+
+        let recommendations = build_recommendations(&[], &telemetry);
+        let external = recommendations
+            .iter()
+            .find(|recommendation| {
+                recommendation.recommendation_id == "drive-external-sharing-inventory"
+            })
+            .expect("external inventory recommendation should exist");
+        let public = recommendations
+            .iter()
+            .find(|recommendation| {
+                recommendation.recommendation_id == "drive-public-link-inventory"
+            })
+            .expect("public link recommendation should exist");
+
+        assert_eq!(external.evidence_count, 12);
+        assert_eq!(public.evidence_count, 3);
+        assert!(external.rationale.contains("not unique files"));
+        assert!(public.rationale.contains("not unique files"));
     }
 }

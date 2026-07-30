@@ -24,6 +24,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
+mod ip_intelligence;
+
 pub struct AdminHelper;
 
 const ADMIN_REPORTS_AUDIT_READONLY_SCOPE: &str =
@@ -90,6 +92,8 @@ struct Finding {
     visibility: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     originating_app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_intelligence: Option<ip_intelligence::IpIntelligence>,
 }
 
 #[derive(Debug)]
@@ -382,6 +386,7 @@ fn finding_from_event(
             })
         }),
         originating_app_id: event_string_parameter(event, "originating_app_id"),
+        ip_intelligence: None,
     }
 }
 
@@ -725,6 +730,7 @@ fn analyze_activities(
                 resource_type: None,
                 visibility: None,
                 originating_app_id: None,
+                ip_intelligence: None,
             }),
     );
 
@@ -785,6 +791,7 @@ fn drive_burst_findings(
             resource_type: None,
             visibility: None,
             originating_app_id: burst.originating_app_id,
+            ip_intelligence: None,
         })
         .collect()
 }
@@ -1007,6 +1014,14 @@ fn build_security_observer_cmd() -> Command {
                 .value_parser(value_parser!(u32).range(5..=1_000))
                 .default_value("50")
                 .value_name("UNIQUE_FILES"),
+        )
+        .arg(
+            Arg::new("ip-intelligence")
+                .long("ip-intelligence")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Enrich finding IPs with authoritative RDAP registration data and optional IPinfo context",
+                ),
         )
         .arg(
             Arg::new("format")
@@ -1344,7 +1359,26 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
 
     let activity_count = activities.len();
     let (findings, telemetry) = analyze_activities(&activities, &config);
-    let findings = filter_findings(findings, min_severity);
+    let mut findings = filter_findings(findings, min_severity);
+    let ip_intelligence = if matches.get_flag("ip-intelligence") {
+        let ipinfo_token = std::env::var(ip_intelligence::IPINFO_TOKEN_ENV).ok();
+        let addresses = findings
+            .iter()
+            .filter_map(|finding| finding.ip_address.clone())
+            .collect::<Vec<_>>();
+        let (entries, summary) =
+            ip_intelligence::enrich_ip_addresses(&client, addresses, ipinfo_token.as_deref()).await;
+        for finding in &mut findings {
+            finding.ip_intelligence = finding
+                .ip_address
+                .as_ref()
+                .and_then(|address| entries.get(address))
+                .cloned();
+        }
+        summary
+    } else {
+        ip_intelligence::IpIntelligenceSummary::disabled()
+    };
     let recommendations = build_recommendations(&findings, &telemetry);
     let report = json!({
         "mode": "read-only",
@@ -1360,6 +1394,7 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         "activitiesAnalyzed": activity_count,
         "findingCount": findings.len(),
         "findings": findings,
+        "ipIntelligence": ip_intelligence,
         "telemetry": telemetry,
         "recommendationCount": recommendations.len(),
         "recommendations": recommendations,
@@ -1592,6 +1627,11 @@ mod tests {
                 .map(String::as_str),
             Some("high")
         );
+        assert!(!matches.get_flag("ip-intelligence"));
+        assert!(build_security_observer_cmd()
+            .try_get_matches_from(["+security-observer", "--ip-intelligence"])
+            .expect("IP intelligence should be opt-in")
+            .get_flag("ip-intelligence"));
         assert!(build_security_observer_cmd()
             .try_get_matches_from(["+security-observer", "--lookback-minutes", "0"])
             .is_err());
@@ -1642,6 +1682,7 @@ mod tests {
             resource_type: None,
             visibility: None,
             originating_app_id: None,
+            ip_intelligence: None,
         };
 
         let value = serde_json::to_value(finding).expect("finding should serialize");
@@ -1657,6 +1698,7 @@ mod tests {
         assert_eq!(value["actor"], "user@wearenexa.com");
         assert_eq!(value["ipAddress"], "203.0.113.30");
         assert_eq!(value["occurrences"], 1);
+        assert!(value.get("ipIntelligence").is_none());
     }
 
     #[test]
@@ -1695,6 +1737,7 @@ mod tests {
                 resource_type: None,
                 visibility: None,
                 originating_app_id: None,
+                ip_intelligence: None,
             },
             Finding {
                 event_id: "login:event-critical:account_disabled_password_leak:0".to_string(),
@@ -1713,6 +1756,7 @@ mod tests {
                 resource_type: None,
                 visibility: None,
                 originating_app_id: None,
+                ip_intelligence: None,
             },
         ];
 

@@ -52,7 +52,8 @@ gws admin-reports +security-observer \
   --lookback-minutes 60 \
   --internal-domain example.com \
   --trusted-domain approved-partner.example \
-  --min-severity critical
+  --min-severity critical \
+  --ip-intelligence
 ```
 
 The observer reads the Login, Admin, OAuth Token, Drive, and Rules audit
@@ -99,6 +100,50 @@ visibility, originating application ID, and DLP rule/detector metadata. File
 titles and file content are intentionally excluded. Consumers should use
 `eventId` as their idempotency key when appending overlapping observer windows
 to a durable store such as Google Sheets.
+
+### IP intelligence
+
+`--ip-intelligence` enriches each finding that has an IP address. It does not
+add Google OAuth scopes and does not change the raw severity or rule selected
+by the observer.
+
+Without any additional credential, the observer:
+
+- classifies public, private, shared, loopback, link-local, documentation,
+  benchmarking, multicast, and reserved addresses locally;
+- uses the official IANA IPv4/IPv6 RDAP bootstrap registries to select a
+  Regional Internet Registry;
+- follows one bounded RIR referral when the authoritative registry differs
+  from the initial allocation;
+- reports the registered network holder, network name and range, RIR, RDAP
+  source URL, and registration country.
+
+Set `GOOGLE_WORKSPACE_CLI_IPINFO_TOKEN` to add the IPinfo data available to the
+token's plan. The observer first requests Core data and falls back to Lite for
+country and ASN. It separately requests privacy data for explicit VPN, proxy,
+Tor, relay, hosting, and service fields. Tokens are passed to the provider but
+are never serialized into report output or error messages.
+
+Every finding uses tri-state `vpn`, `proxy`, `tor`, and `relay` values:
+`detected`, `not_detected`, or `unknown`. `unknown` is retained when no
+qualified provider returned the specific signal. The observer never infers VPN
+status from an ASN name, network owner, hosting flag, country, or repetition.
+
+Treat the fields according to their evidence source:
+
+- `networkOwner` is the registered organization holding the address range, not
+  the person using the IP;
+- `registrationCountry` is registry data and may differ from physical origin;
+- `country`, `region`, `city`, coordinates, and timezone are provider
+  geolocation estimates, not proof of a user's location;
+- VPN/proxy/Tor results are point-in-time provider observations and should
+  inform human review rather than independently prove compromise.
+
+Enrichment is best effort and deduplicated per unique IP within a run. Provider
+failures are recorded as bounded error codes inside `ipIntelligence`; they do
+not suppress or discard the underlying Workspace finding. The report-level
+`ipIntelligence` summary shows enabled providers and complete, partial, and
+unavailable lookup counts.
 
 The report also includes:
 

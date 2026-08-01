@@ -29,8 +29,6 @@ const MAX_CELLS_PER_TAB: usize = 300_000;
 const FINDINGS_RANGE: &str = "Findings!A:AB";
 const INVESTIGATIONS_RANGE: &str = "Investigations!A:O";
 const RECOMMENDATIONS_RANGE: &str = "Recommendations!A:M";
-const NOTIFICATION_RECIPIENTS: &[&str] = &["security-operations@example.com"];
-
 const ALLOWED_SOURCE_LINKS: &[(&str, &str)] = &[
     (
         "Google Admin security",
@@ -1344,11 +1342,8 @@ fn build_notification_manifest(plan: &MonitorSyncPlan) -> NotificationManifest {
         effective: NotifierAction::Suppress,
         candidate_action: plan.email.candidate_action,
         eligible: false,
-        recipient_policy: "fixed",
-        recipients: NOTIFICATION_RECIPIENTS
-            .iter()
-            .map(|recipient| (*recipient).to_string())
-            .collect(),
+        recipient_policy: "unresolved",
+        recipients: Vec::new(),
         requires_readback_success: true,
         authorization_required: true,
         reason: if plan.gate.schema_compatible
@@ -2945,10 +2940,7 @@ mod tests {
         assert_eq!(bundle["notifier"]["effective"], "suppress");
         assert_eq!(bundle["notification"]["eligible"], false);
         assert_eq!(bundle["notification"]["candidateAction"], "emit");
-        assert_eq!(
-            bundle["notification"]["recipients"],
-            json!(["security-operations@example.com"])
-        );
+        assert_eq!(bundle["notification"]["recipients"], json!([]));
     }
 
     #[test]

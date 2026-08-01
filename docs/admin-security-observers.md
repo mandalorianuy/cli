@@ -384,6 +384,29 @@ authorize a schema migration, provider write, notification, production effect,
 or human acceptance. A future writer still requires separate authorization,
 backup, exact target binding, and post-write readback.
 
+### Offline execution program and receipt simulator (T4)
+
+`+security-monitor-program` compiles an eligible cutover bundle, exact target
+snapshot, and explicit writer policy into a canonically hashed local execution
+program. `--simulate` is mandatory; no live writer is implemented. The fixed
+phase order covers admission, backup pinning, additive migration, the three tab
+manifests, exact readback, commit-or-rollback, and notification handoff.
+
+```bash
+gws admin-reports +security-monitor-program \
+  --bundle ./evidence/security-monitor-bundle.json \
+  --target ./evidence/monitor-target-snapshot.json \
+  --policy ./evidence/security-monitor-writer-policy.json \
+  --simulate \
+  --format json
+```
+
+Every phase emits a chained, fingerprinted receipt. Failure produces rollback
+evidence and permanently suppresses notification; an exact completed replay is
+a no-op. The policy is an input contract, not approval. All executable paths
+keep `externalWritesAllowed=false`, `liveApplyAvailable=false`, and
+`humanAuthorizationRequired=true`.
+
 ## DLP discovery workflow
 
 Metadata alone cannot determine whether a document contains customer records,

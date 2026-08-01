@@ -28,6 +28,7 @@ mod ip_intelligence;
 mod microsoft_graph_auth;
 mod monitor_contract;
 mod monitor_cutover;
+mod monitor_program;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -1098,6 +1099,64 @@ fn build_security_monitor_plan_cmd() -> Command {
         )
 }
 
+fn build_security_monitor_program_cmd() -> Command {
+    Command::new("+security-monitor-program")
+        .about("[Helper] Compile and simulate a local Security Intelligence Monitor execution program")
+        .arg(
+            Arg::new("bundle")
+                .long("bundle")
+                .required(true)
+                .value_name("FILE")
+                .help("T3b cutover bundle JSON; it is never sent to an external service"),
+        )
+        .arg(
+            Arg::new("target")
+                .long("target")
+                .required(true)
+                .value_name("FILE")
+                .help("Pinned local target snapshot JSON"),
+        )
+        .arg(
+            Arg::new("policy")
+                .long("policy")
+                .required(true)
+                .value_name("FILE")
+                .help("Explicit local writer policy JSON; presence is not human approval"),
+        )
+        .arg(
+            Arg::new("simulate")
+                .long("simulate")
+                .required(true)
+                .action(ArgAction::SetTrue)
+                .help("Required: run only the deterministic local receipt simulator"),
+        )
+        .arg(
+            Arg::new("failure-phase")
+                .long("failure-phase")
+                .value_name("PHASE")
+                .value_parser(parse_security_monitor_failure_phase)
+                .help("Optional local simulation fault; it cannot enable external writes"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads only the three local JSON files.\n  Compiles typed requests and receipts; it never calls Sheets, Gmail, Google Admin, Microsoft Graph, or any writer.\n  All simulations keep externalWritesAllowed=false, liveApplyAvailable=false, and notification=suppress.",
+        )
+}
+
+fn parse_security_monitor_failure_phase(value: &str) -> Result<String, String> {
+    if monitor_program::failure_phase_names().contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("unknown failure phase '{value}'"))
+    }
+}
+
 fn security_observer_config(matches: &ArgMatches) -> SecurityObserverConfig {
     let mut trusted_domains: HashSet<String> = matches
         .get_many::<String>("internal-domain")
@@ -1591,6 +1650,64 @@ fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
     Ok(())
 }
 
+fn handle_security_monitor_program(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("simulate") {
+        return Err(GwsError::Validation(
+            "+security-monitor-program requires --simulate; external execution is not implemented"
+                .to_string(),
+        ));
+    }
+    let bundle_path = matches
+        .get_one::<String>("bundle")
+        .expect("bundle is required by clap");
+    let target_path = matches
+        .get_one::<String>("target")
+        .expect("target is required by clap");
+    let policy_path = matches
+        .get_one::<String>("policy")
+        .expect("policy is required by clap");
+    let bundle = read_monitor_plan_json(bundle_path, "--bundle")?;
+    let target = read_monitor_plan_json(target_path, "--target")?;
+    let policy = read_monitor_plan_json(policy_path, "--policy")?;
+    let program =
+        monitor_program::compile_execution_program(&bundle, &target, &policy).map_err(|error| {
+            GwsError::Validation(format!("Monitor execution program rejected: {error}"))
+        })?;
+    let failure_phase = matches
+        .get_one::<String>("failure-phase")
+        .map(String::as_str);
+    let simulation =
+        monitor_program::simulate_execution_program(&program, failure_phase).map_err(|error| {
+            GwsError::Validation(format!("Monitor execution simulation rejected: {error}"))
+        })?;
+    let replay = if failure_phase.is_none() {
+        Some(
+            monitor_program::replay_execution_program(&program, &simulation).map_err(|error| {
+                GwsError::Validation(format!("Monitor execution replay rejected: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let output = json!({
+        "program": program,
+        "simulation": simulation,
+        "replay": replay,
+        "externalWritesAllowed": false,
+        "liveApplyAvailable": false,
+        "notificationEffective": "suppress",
+        "humanAuthorizationRequired": true,
+    });
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&output, &format));
+    Ok(())
+}
+
 impl Helper for AdminHelper {
     fn inject_commands(
         &self,
@@ -1600,6 +1717,7 @@ impl Helper for AdminHelper {
         cmd = cmd.subcommand(build_admin_observer_cmd());
         cmd = cmd.subcommand(build_security_observer_cmd());
         cmd = cmd.subcommand(build_security_monitor_plan_cmd());
+        cmd = cmd.subcommand(build_security_monitor_program_cmd());
         cmd
     }
 
@@ -1620,6 +1738,10 @@ impl Helper for AdminHelper {
             }
             if let Some(plan_matches) = matches.subcommand_matches("+security-monitor-plan") {
                 handle_security_monitor_plan(plan_matches)?;
+                return Ok(true);
+            }
+            if let Some(program_matches) = matches.subcommand_matches("+security-monitor-program") {
+                handle_security_monitor_program(program_matches)?;
                 return Ok(true);
             }
             Ok(false)
@@ -1681,6 +1803,7 @@ mod tests {
         assert!(names.contains(&"+admin-observer"));
         assert!(names.contains(&"+security-observer"));
         assert!(names.contains(&"+security-monitor-plan"));
+        assert!(names.contains(&"+security-monitor-program"));
     }
 
     #[test]
@@ -1739,6 +1862,32 @@ mod tests {
                 "Microsoft certificate configuration should document {variable}"
             );
         }
+    }
+
+    #[test]
+    fn security_monitor_program_requires_explicit_local_simulation() {
+        let matches = build_security_monitor_program_cmd()
+            .try_get_matches_from([
+                "+security-monitor-program",
+                "--bundle",
+                "evidence/bundle.json",
+                "--target",
+                "evidence/target.json",
+                "--policy",
+                "evidence/policy.json",
+                "--simulate",
+                "--failure-phase",
+                "findings_writes",
+            ])
+            .expect("program arguments should parse");
+
+        assert!(matches.get_flag("simulate"));
+        assert_eq!(
+            matches
+                .get_one::<String>("failure-phase")
+                .map(String::as_str),
+            Some("findings_writes")
+        );
     }
 
     #[test]

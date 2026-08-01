@@ -27,6 +27,7 @@ use std::pin::Pin;
 mod ip_intelligence;
 mod microsoft_graph_auth;
 mod monitor_contract;
+mod monitor_cutover;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -1062,6 +1063,41 @@ fn build_security_observer_cmd() -> Command {
         )
 }
 
+fn build_security_monitor_plan_cmd() -> Command {
+    Command::new("+security-monitor-plan")
+        .about("[Helper] Validate a Security Intelligence Monitor cutover without external effects")
+        .arg(
+            Arg::new("input")
+                .long("input")
+                .required(true)
+                .value_name("FILE")
+                .help("Read-only observer report containing monitorIntegration"),
+        )
+        .arg(
+            Arg::new("existing")
+                .long("existing")
+                .required(true)
+                .value_name("FILE")
+                .help("Local monitor target snapshot with schemaVersion and current records"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .action(ArgAction::SetTrue)
+                .help("Required: emit a local plan only; never write a Sheet or send email"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads only the two local JSON files.\n  The command never calls Google Sheets, Gmail, Microsoft Graph, or any writer.\n  A schema or coverage gate failure is represented as blocked in the plan.",
+        )
+}
+
 fn security_observer_config(matches: &ArgMatches) -> SecurityObserverConfig {
     let mut trusted_domains: HashSet<String> = matches
         .get_many::<String>("internal-domain")
@@ -1506,6 +1542,54 @@ fn insert_security_posture(
     Ok(())
 }
 
+fn read_monitor_plan_json(path: &str, flag_name: &str) -> Result<Value, GwsError> {
+    let safe_path = crate::validate::validate_safe_file_path(path, flag_name)?;
+    let contents = std::fs::read_to_string(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not read monitor plan input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    serde_json::from_str(&contents).map_err(|error| {
+        GwsError::Validation(format!(
+            "Monitor plan input is not valid JSON: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })
+}
+
+fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("dry-run") {
+        return Err(GwsError::Validation(
+            "+security-monitor-plan requires --dry-run; external cutover is not implemented"
+                .to_string(),
+        ));
+    }
+    let input_path = matches
+        .get_one::<String>("input")
+        .expect("input is required by clap");
+    let existing_path = matches
+        .get_one::<String>("existing")
+        .expect("existing is required by clap");
+    let input = read_monitor_plan_json(input_path, "--input")?;
+    let existing = read_monitor_plan_json(existing_path, "--existing")?;
+    let plan = monitor_cutover::build_sync_plan(&input, &existing)
+        .map_err(|error| GwsError::Validation(format!("Monitor cutover plan rejected: {error}")))?;
+    let value = serde_json::to_value(plan).map_err(|error| {
+        GwsError::Other(anyhow::anyhow!(
+            "Could not serialize monitor cutover plan: {error}"
+        ))
+    })?;
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&value, &format));
+    Ok(())
+}
+
 impl Helper for AdminHelper {
     fn inject_commands(
         &self,
@@ -1514,6 +1598,7 @@ impl Helper for AdminHelper {
     ) -> Command {
         cmd = cmd.subcommand(build_admin_observer_cmd());
         cmd = cmd.subcommand(build_security_observer_cmd());
+        cmd = cmd.subcommand(build_security_monitor_plan_cmd());
         cmd
     }
 
@@ -1530,6 +1615,10 @@ impl Helper for AdminHelper {
             }
             if let Some(observer_matches) = matches.subcommand_matches("+security-observer") {
                 handle_security_observer(observer_matches).await?;
+                return Ok(true);
+            }
+            if let Some(plan_matches) = matches.subcommand_matches("+security-monitor-plan") {
+                handle_security_monitor_plan(plan_matches)?;
                 return Ok(true);
             }
             Ok(false)
@@ -1590,6 +1679,48 @@ mod tests {
 
         assert!(names.contains(&"+admin-observer"));
         assert!(names.contains(&"+security-observer"));
+        assert!(names.contains(&"+security-monitor-plan"));
+    }
+
+    #[test]
+    fn security_monitor_plan_command_is_explicitly_dry_run() {
+        let matches = build_security_monitor_plan_cmd()
+            .try_get_matches_from([
+                "+security-monitor-plan",
+                "--input",
+                "evidence/report.json",
+                "--existing",
+                "evidence/monitor-target.json",
+                "--dry-run",
+            ])
+            .expect("monitor plan arguments should parse");
+
+        assert!(matches.get_flag("dry-run"));
+        assert_eq!(
+            matches.get_one::<String>("input").map(String::as_str),
+            Some("evidence/report.json")
+        );
+        assert_eq!(
+            matches.get_one::<String>("existing").map(String::as_str),
+            Some("evidence/monitor-target.json")
+        );
+    }
+
+    #[test]
+    fn security_monitor_plan_rejects_implicit_external_execution() {
+        let matches = build_security_monitor_plan_cmd()
+            .try_get_matches_from([
+                "+security-monitor-plan",
+                "--input",
+                "evidence/report.json",
+                "--existing",
+                "evidence/monitor-target.json",
+            ])
+            .expect("arguments should parse before the explicit dry-run gate");
+
+        let error = handle_security_monitor_plan(&matches)
+            .expect_err("live execution must not be available");
+        assert!(error.to_string().contains("requires --dry-run"));
     }
 
     #[test]

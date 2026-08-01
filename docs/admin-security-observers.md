@@ -345,6 +345,34 @@ happened; a recommendation records a proposed human decision. Recommended
 states are `proposed`, `accepted`, `rejected`, and `implemented`. The observer
 never changes a recommendation state and never applies a DLP or sharing rule.
 
+### Controlled cutover planner (T3)
+
+`+security-monitor-plan` is a local, deterministic planner for a later
+synchronizer. It accepts a complete read-only observer report plus a local
+monitor-target snapshot and emits bounded `create`, `update`, `noop`, and
+`suppress` operations. It never calls Sheets, Gmail, Google Admin, Microsoft
+Graph, or another writer, and it requires `--dry-run`.
+
+Only the additive target `schemaVersion=7` is eligible for planning. Version 6
+and incomplete coverage remain blocked with `externalWritesAllowed=false`.
+Human-owned status, disposition, notes, owner, reviewer, decision, and
+resolution fields are never included in an automatic patch. Conflicting
+duplicates, unknown sources, non-allowlisted URLs, formula-like values, and
+unknown recommendation references fail closed.
+
+```bash
+gws admin-reports +security-monitor-plan \
+  --input ./evidence/security-observer.json \
+  --existing ./evidence/monitor-target.json \
+  --dry-run \
+  --format json
+```
+
+`eligible_pending_authorization` is engineering readiness only. It does not
+authorize a schema migration, provider write, notification, production effect,
+or human acceptance. A future writer still requires separate authorization,
+backup, exact target binding, and post-write readback.
+
 ## DLP discovery workflow
 
 Metadata alone cannot determine whether a document contains customer records,

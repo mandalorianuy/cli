@@ -14,13 +14,22 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use uuid::Uuid;
 
 pub(super) const CUTOVER_PLAN_VERSION: &str = "security_intelligence_monitor_cutover_v1";
+pub(super) const CUTOVER_BUNDLE_VERSION: &str = "security_intelligence_monitor_cutover_bundle_v1";
 pub(super) const TARGET_SCHEMA_VERSION: u64 = 7;
 const CONTRACT_VERSION: &str = "security_intelligence_monitor_v1";
+const FINGERPRINT_ALGORITHM: &str = "sha256-canonical-json-v1";
+const MAX_ROWS_PER_TAB: usize = 10_000;
+const MAX_CELLS_PER_TAB: usize = 300_000;
+const FINDINGS_RANGE: &str = "Findings!A:AB";
+const INVESTIGATIONS_RANGE: &str = "Investigations!A:O";
+const RECOMMENDATIONS_RANGE: &str = "Recommendations!A:M";
+const NOTIFICATION_RECIPIENTS: &[&str] = &["security-operations@example.com"];
 
 const ALLOWED_SOURCE_LINKS: &[(&str, &str)] = &[
     (
@@ -85,9 +94,16 @@ const HUMAN_FIELDS: &[&str] = &[
     "notes",
     "owner",
     "resolution",
+    "reviewedBy",
     "reviewedAt",
     "reviewer",
     "status",
+    "email",
+    "emailDisposition",
+    "emailSentAt",
+    "emailStatus",
+    "notificationStatus",
+    "links",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +167,7 @@ struct SyncOperation {
 struct EmailOperation {
     action: NotifierAction,
     candidate_action: NotifierAction,
+    candidate_eligible: bool,
     eligible: bool,
     reason: String,
     payload: Value,
@@ -175,6 +192,231 @@ pub(super) struct MonitorSyncPlan {
     investigations: Vec<SyncOperation>,
     recommendations: Vec<SyncOperation>,
     email: EmailOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MonitorCutoverBundle {
+    #[serde(flatten)]
+    plan: MonitorSyncPlan,
+    bundle_version: &'static str,
+    fingerprints: FingerprintManifest,
+    preconditions: BundlePreconditions,
+    migration: SchemaMigrationManifest,
+    sheets: SheetsManifest,
+    readback: ReadbackManifest,
+    rollback: RollbackManifest,
+    no_effect: NoEffectManifest,
+    notification: NotificationManifest,
+    notifier: NotificationManifest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FingerprintManifest {
+    algorithm: &'static str,
+    input: String,
+    target: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundlePreconditions {
+    mode: ModePrecondition,
+    coverage: CoveragePrecondition,
+    schema: SchemaPrecondition,
+    ids: IdPrecondition,
+    capacity: CapacityPrecondition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<SnapshotPrecondition>,
+    authorization_required: bool,
+    external_writes_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModePrecondition {
+    expected: &'static str,
+    observed: &'static str,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoveragePrecondition {
+    coverage_complete: bool,
+    required_coverage_complete: bool,
+    fail_closed: bool,
+    sources: Vec<RawCoverage>,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaPrecondition {
+    expected: u64,
+    observed: u64,
+    compatible: bool,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdPrecondition {
+    input_unique: bool,
+    target_unique: bool,
+    exact_key_fields: BTreeMap<String, String>,
+    input_counts: BTreeMap<String, usize>,
+    target_counts: BTreeMap<String, usize>,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapacityPrecondition {
+    limits: BTreeMap<String, usize>,
+    requested_rows: BTreeMap<String, usize>,
+    target_rows: BTreeMap<String, usize>,
+    requested_cells: BTreeMap<String, usize>,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotPrecondition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    captured_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_state_fingerprint: Option<String>,
+    observed_state_fingerprint: String,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaMigrationManifest {
+    from_version: u64,
+    to_version: u64,
+    status: &'static str,
+    mode: &'static str,
+    external_writes_allowed: bool,
+    additions: Vec<SchemaColumnAddition>,
+    preserved_existing_fields: Vec<&'static str>,
+    invariants: Vec<&'static str>,
+    forbidden_operations: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaColumnAddition {
+    tab: &'static str,
+    field: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetsManifest {
+    phase: &'static str,
+    external_writes_allowed: bool,
+    tab_order: Vec<&'static str>,
+    operation_order: Vec<&'static str>,
+    tabs: Vec<SheetTabManifest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetTabManifest {
+    name: &'static str,
+    key_field: &'static str,
+    range: &'static str,
+    lookup_range: &'static str,
+    operations: Vec<SheetOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetOperation {
+    action: SyncAction,
+    key: String,
+    eligible: bool,
+    reason: String,
+    lookup: SheetLookup,
+    record: BTreeMap<String, Value>,
+    patch: BTreeMap<String, Value>,
+    preserved_human_fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetLookup {
+    range: &'static str,
+    key_field: &'static str,
+    key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadbackManifest {
+    phase: &'static str,
+    executed: bool,
+    success: bool,
+    assertions: Vec<ReadbackAssertion>,
+    on_failure: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadbackAssertion {
+    tab: &'static str,
+    range: &'static str,
+    key_field: &'static str,
+    key: String,
+    action: SyncAction,
+    expected_machine_record: BTreeMap<String, Value>,
+    preserved_human_fields: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RollbackManifest {
+    strategy: &'static str,
+    external_writes_performed: bool,
+    target_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_revision: Option<String>,
+    steps: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NoEffectManifest {
+    sheets_writes_performed: bool,
+    email_sent: bool,
+    credentials_changed: bool,
+    target_mutated: bool,
+    local_bundle_only: bool,
+    rollback_action: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationManifest {
+    phase: &'static str,
+    action: NotifierAction,
+    effective: NotifierAction,
+    candidate_action: NotifierAction,
+    eligible: bool,
+    recipient_policy: &'static str,
+    recipients: Vec<String>,
+    requires_readback_success: bool,
+    authorization_required: bool,
+    reason: &'static str,
+    payload: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -307,6 +549,50 @@ struct ExistingTarget {
     investigations: Vec<BTreeMap<String, Value>>,
     #[serde(default)]
     recommendations: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    snapshot: Option<RawSnapshot>,
+    #[serde(default)]
+    capacity: Option<RawCapacity>,
+    #[serde(default, alias = "expectedInputHash", alias = "inputHash")]
+    expected_input_fingerprint: Option<String>,
+    #[serde(default, alias = "stateHash", alias = "hash", alias = "snapshotHash")]
+    state_fingerprint: Option<String>,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RawSnapshot {
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    captured_at: Option<String>,
+    #[serde(
+        default,
+        alias = "fingerprint",
+        alias = "hash",
+        alias = "stateHash",
+        alias = "snapshotHash"
+    )]
+    state_fingerprint: Option<String>,
+    #[serde(default, alias = "inputHash")]
+    input_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RawCapacity {
+    #[serde(default)]
+    findings: Option<usize>,
+    #[serde(default)]
+    investigations: Option<usize>,
+    #[serde(default)]
+    recommendations: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -412,9 +698,10 @@ pub(super) fn build_sync_plan(
         } else {
             NotifierAction::Suppress
         },
-        eligible: gate_open,
+        candidate_eligible: gate_open,
+        eligible: false,
         reason: if gate_open {
-            "external_notification_disabled_in_dry_run".to_string()
+            "notification_requires_successful_readback_and_human_authorization".to_string()
         } else {
             "notification_blocked_by_cutover_gate".to_string()
         },
@@ -447,6 +734,634 @@ pub(super) fn build_sync_plan(
         )?,
         email,
     })
+}
+
+pub(super) fn build_cutover_bundle(
+    input: &Value,
+    target: &Value,
+) -> Result<MonitorCutoverBundle, CutoverError> {
+    let input_fingerprint = fingerprint_value(input);
+    let target_fingerprint = target_state_fingerprint(target)?;
+    let existing = parse_existing_target(target)?;
+    let snapshot = validate_snapshot_metadata(&existing, &input_fingerprint, &target_fingerprint)?;
+    let input_counts = normalized_input_counts(input)?;
+    let plan = build_sync_plan(input, target)?;
+    let capacity = build_capacity_precondition(&input_counts, &existing)?;
+    let migration = build_migration_manifest(plan.observed_target_schema_version);
+    let sheets = build_sheets_manifest(&plan);
+    let readback = build_readback_manifest(&plan);
+    let notification = build_notification_manifest(&plan);
+    let rollback = RollbackManifest {
+        strategy: "retain_target_snapshot_and_discard_local_bundle",
+        external_writes_performed: false,
+        target_fingerprint: target_fingerprint.clone(),
+        target_revision: merged_snapshot(&existing).and_then(|snapshot| snapshot.revision),
+        steps: vec![
+            "do_not_apply_external_writes_from_this_bundle",
+            "retain_original_target_snapshot",
+            "discard_local_bundle_if_readback_or_authorization_fails",
+            "future_authorized_writer_must_restore_backup_before_retry",
+        ],
+    };
+    let no_effect = NoEffectManifest {
+        sheets_writes_performed: false,
+        email_sent: false,
+        credentials_changed: false,
+        target_mutated: false,
+        local_bundle_only: true,
+        rollback_action: "discard_bundle_and_retain_target_snapshot",
+    };
+    let preconditions = BundlePreconditions {
+        mode: ModePrecondition {
+            expected: "read-only",
+            observed: "read-only",
+            satisfied: true,
+        },
+        coverage: CoveragePrecondition {
+            coverage_complete: plan.gate.coverage_complete,
+            required_coverage_complete: plan.gate.required_coverage_complete,
+            fail_closed: plan.gate.fail_closed,
+            sources: plan.coverage.clone(),
+            satisfied: plan.gate.coverage_complete
+                && plan.gate.required_coverage_complete
+                && !plan.gate.fail_closed,
+        },
+        schema: SchemaPrecondition {
+            expected: TARGET_SCHEMA_VERSION,
+            observed: plan.observed_target_schema_version,
+            compatible: plan.gate.schema_compatible,
+            satisfied: plan.gate.schema_compatible,
+        },
+        ids: build_id_precondition(&input_counts, &existing),
+        capacity,
+        snapshot,
+        authorization_required: true,
+        external_writes_allowed: false,
+    };
+
+    Ok(MonitorCutoverBundle {
+        plan,
+        bundle_version: CUTOVER_BUNDLE_VERSION,
+        fingerprints: FingerprintManifest {
+            algorithm: FINGERPRINT_ALGORITHM,
+            input: input_fingerprint,
+            target: target_fingerprint,
+        },
+        preconditions,
+        migration,
+        sheets,
+        readback,
+        rollback,
+        no_effect,
+        notification: notification.clone(),
+        notifier: notification,
+    })
+}
+
+fn parse_existing_target(target: &Value) -> Result<ExistingTarget, CutoverError> {
+    serde_json::from_value(target.clone())
+        .map_err(|_| CutoverError::invalid("invalid monitor target state shape"))
+}
+
+fn normalized_input_counts(input: &Value) -> Result<BTreeMap<String, usize>, CutoverError> {
+    let contract_value = input
+        .pointer("/monitorIntegration/security_intelligence_monitor_v1")
+        .ok_or_else(|| CutoverError::invalid("missing security intelligence monitor contract"))?;
+    let contract: RawContract = serde_json::from_value(contract_value.clone()).map_err(|_| {
+        CutoverError::invalid("invalid security intelligence monitor contract shape")
+    })?;
+    validate_contract(&contract)?;
+    let findings = normalize_findings(contract.findings)?;
+    let recommendations = normalize_recommendations(contract.recommendations)?;
+    validate_recommendation_references(&findings, &recommendations)?;
+    Ok(BTreeMap::from([
+        ("findings".to_string(), findings.len()),
+        ("investigations".to_string(), findings.len()),
+        ("recommendations".to_string(), recommendations.len()),
+    ]))
+}
+
+fn fingerprint_value(value: &Value) -> String {
+    let canonical = canonicalize_json(value);
+    let bytes = serde_json::to_vec(&canonical).expect("JSON values should serialize");
+    sha256_fingerprint(&bytes)
+}
+
+fn target_state_fingerprint(target: &Value) -> Result<String, CutoverError> {
+    let object = target
+        .as_object()
+        .ok_or_else(|| CutoverError::invalid("monitor target state must be an object"))?;
+    let mut state = serde_json::Map::new();
+    for field in [
+        "schemaVersion",
+        "findings",
+        "investigations",
+        "recommendations",
+    ] {
+        let value = object.get(field).cloned().unwrap_or_else(|| match field {
+            "findings" | "investigations" | "recommendations" => Value::Array(Vec::new()),
+            _ => Value::Null,
+        });
+        state.insert(field.to_string(), value);
+    }
+    Ok(fingerprint_value(&Value::Object(state)))
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in fields {
+                canonical.insert(key.clone(), canonicalize_json(value));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(items) => {
+            let mut canonical = items.iter().map(canonicalize_json).collect::<Vec<_>>();
+            canonical.sort_by(|left, right| {
+                let left = serde_json::to_vec(left).expect("JSON values should serialize");
+                let right = serde_json::to_vec(right).expect("JSON values should serialize");
+                left.cmp(&right)
+            });
+            Value::Array(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn sha256_fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut fingerprint = String::from("sha256:");
+    for byte in digest {
+        fingerprint.push_str(&format!("{byte:02x}"));
+    }
+    fingerprint
+}
+
+fn validate_snapshot_metadata(
+    existing: &ExistingTarget,
+    input_fingerprint: &str,
+    target_fingerprint: &str,
+) -> Result<Option<SnapshotPrecondition>, CutoverError> {
+    let snapshot = merged_snapshot(existing);
+    let expected_input_fingerprint = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.input_fingerprint.as_deref())
+        .or(existing.expected_input_fingerprint.as_deref());
+    if let Some(expected) = expected_input_fingerprint {
+        validate_fingerprint("expected input fingerprint", expected)?;
+        if expected != input_fingerprint {
+            return Err(CutoverError::invalid("stale input fingerprint"));
+        }
+    }
+
+    let expected_state_fingerprint = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.state_fingerprint.as_deref())
+        .or(existing.state_fingerprint.as_deref())
+        .map(str::to_string);
+    if let Some(expected) = expected_state_fingerprint.as_deref() {
+        validate_fingerprint("target snapshot fingerprint", expected)?;
+        if expected != target_fingerprint {
+            return Err(CutoverError::invalid("stale target snapshot hash"));
+        }
+    }
+
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    if let Some(revision) = &snapshot.revision {
+        validate_snapshot_text("snapshot revision", revision, 256)?;
+    }
+    if let Some(etag) = &snapshot.etag {
+        validate_snapshot_text("snapshot etag", etag, 512)?;
+    }
+    if let Some(captured_at) = &snapshot.captured_at {
+        validate_timestamp("snapshot capturedAt", captured_at)?;
+    }
+    Ok(Some(SnapshotPrecondition {
+        revision: snapshot.revision,
+        etag: snapshot.etag,
+        captured_at: snapshot.captured_at,
+        expected_state_fingerprint,
+        observed_state_fingerprint: target_fingerprint.to_string(),
+        satisfied: true,
+    }))
+}
+
+fn merged_snapshot(existing: &ExistingTarget) -> Option<RawSnapshot> {
+    let mut snapshot = existing.snapshot.clone().unwrap_or(RawSnapshot {
+        revision: None,
+        etag: None,
+        captured_at: None,
+        state_fingerprint: None,
+        input_fingerprint: None,
+    });
+    snapshot.revision = snapshot.revision.or_else(|| existing.revision.clone());
+    snapshot.etag = snapshot.etag.or_else(|| existing.etag.clone());
+    snapshot.state_fingerprint = snapshot
+        .state_fingerprint
+        .or_else(|| existing.state_fingerprint.clone());
+    if snapshot.input_fingerprint.is_none() {
+        snapshot.input_fingerprint = existing.expected_input_fingerprint.clone();
+    }
+    if snapshot.revision.is_none()
+        && snapshot.etag.is_none()
+        && snapshot.captured_at.is_none()
+        && snapshot.state_fingerprint.is_none()
+        && snapshot.input_fingerprint.is_none()
+        && existing.snapshot.is_none()
+    {
+        None
+    } else {
+        Some(snapshot)
+    }
+}
+
+fn validate_fingerprint(field: &str, value: &str) -> Result<(), CutoverError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(CutoverError::invalid(format!("invalid {field}")));
+    };
+    if hex.len() != 64 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(CutoverError::invalid(format!("invalid {field}")));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_text(field: &str, value: &str, max_chars: usize) -> Result<(), CutoverError> {
+    if value.trim().is_empty()
+        || value.chars().count() > max_chars
+        || value.chars().any(|character| character.is_control())
+        || value.trim_start().starts_with(['=', '+', '-', '@'])
+        || value.contains("http://")
+        || value.contains("https://")
+    {
+        return Err(CutoverError::invalid(format!("invalid {field}")));
+    }
+    Ok(())
+}
+
+fn build_id_precondition(
+    input_counts: &BTreeMap<String, usize>,
+    existing: &ExistingTarget,
+) -> IdPrecondition {
+    let mut exact_key_fields = BTreeMap::new();
+    exact_key_fields.insert("Findings".to_string(), "eventId".to_string());
+    exact_key_fields.insert("Investigations".to_string(), "investigationId".to_string());
+    exact_key_fields.insert(
+        "Recommendations".to_string(),
+        "recommendationId".to_string(),
+    );
+
+    let target_counts = BTreeMap::from([
+        ("findings".to_string(), existing.findings.len()),
+        ("investigations".to_string(), existing.investigations.len()),
+        (
+            "recommendations".to_string(),
+            existing.recommendations.len(),
+        ),
+    ]);
+    IdPrecondition {
+        input_unique: true,
+        target_unique: true,
+        exact_key_fields,
+        input_counts: input_counts.clone(),
+        target_counts,
+        satisfied: true,
+    }
+}
+
+fn build_capacity_precondition(
+    input_counts: &BTreeMap<String, usize>,
+    existing: &ExistingTarget,
+) -> Result<CapacityPrecondition, CutoverError> {
+    let configured = existing.capacity.as_ref();
+    let limits = BTreeMap::from([
+        (
+            "findings".to_string(),
+            configured
+                .and_then(|capacity| capacity.findings)
+                .unwrap_or(MAX_ROWS_PER_TAB),
+        ),
+        (
+            "investigations".to_string(),
+            configured
+                .and_then(|capacity| capacity.investigations)
+                .unwrap_or(MAX_ROWS_PER_TAB),
+        ),
+        (
+            "recommendations".to_string(),
+            configured
+                .and_then(|capacity| capacity.recommendations)
+                .unwrap_or(MAX_ROWS_PER_TAB),
+        ),
+    ]);
+    let requested_rows = input_counts.clone();
+    let target_rows = BTreeMap::from([
+        ("findings".to_string(), existing.findings.len()),
+        ("investigations".to_string(), existing.investigations.len()),
+        (
+            "recommendations".to_string(),
+            existing.recommendations.len(),
+        ),
+    ]);
+    let column_counts = BTreeMap::from([
+        ("findings".to_string(), 28usize),
+        ("investigations".to_string(), 15usize),
+        ("recommendations".to_string(), 13usize),
+    ]);
+    let mut requested_cells = BTreeMap::new();
+    for collection in ["findings", "investigations", "recommendations"] {
+        let limit = limits[collection];
+        if limit > MAX_ROWS_PER_TAB {
+            return Err(CutoverError::invalid(format!(
+                "{collection} capacity exceeds safety limit"
+            )));
+        }
+        let rows = requested_rows[collection].max(target_rows[collection]);
+        if rows > limit {
+            return Err(CutoverError::invalid(format!(
+                "{collection} capacity overflow"
+            )));
+        }
+        let cells = rows
+            .checked_mul(column_counts[collection])
+            .ok_or_else(|| CutoverError::invalid(format!("{collection} capacity overflow")))?;
+        if cells > MAX_CELLS_PER_TAB {
+            return Err(CutoverError::invalid(format!(
+                "{collection} cell capacity overflow"
+            )));
+        }
+        requested_cells.insert(collection.to_string(), cells);
+    }
+    Ok(CapacityPrecondition {
+        limits,
+        requested_rows,
+        target_rows,
+        requested_cells,
+        satisfied: true,
+    })
+}
+
+fn build_migration_manifest(observed_schema_version: u64) -> SchemaMigrationManifest {
+    let status = if observed_schema_version == 7 {
+        "target_already_schema_7"
+    } else if observed_schema_version == 6 {
+        "blocked_current_schema"
+    } else {
+        "blocked_schema_mismatch"
+    };
+    SchemaMigrationManifest {
+        from_version: 6,
+        to_version: 7,
+        status,
+        mode: "additive_only",
+        external_writes_allowed: false,
+        additions: schema_additions(),
+        preserved_existing_fields: HUMAN_FIELDS.to_vec(),
+        invariants: vec![
+            "append_only_columns",
+            "existing_cells_are_not_reinterpreted",
+            "existing_rows_are_not_deleted",
+            "human_fields_are_preserved",
+        ],
+        forbidden_operations: vec![
+            "delete_columns",
+            "delete_cells",
+            "delete_rows",
+            "reinterpret_existing_columns",
+            "overwrite_human_fields",
+        ],
+    }
+}
+
+fn schema_additions() -> Vec<SchemaColumnAddition> {
+    vec![
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "sourceKind",
+            reason: "separar la nube y el tipo de fuente para correlación determinista",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "eventTime",
+            reason: "preservar el instante del evento aparte de la observación",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "rawSeverity",
+            reason: "preservar la severidad cruda sin mezclarla con el veredicto contextual",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "contextualVerdict",
+            reason: "separar la conclusión operacional de la severidad del proveedor",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "assertionsFact",
+            reason: "preservar hechos observados con clasificación explícita",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "assertionsInference",
+            reason: "preservar inferencias sin presentarlas como hechos",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "assertionsMissingData",
+            reason: "hacer visibles los datos faltantes antes de una decisión humana",
+        },
+        SchemaColumnAddition {
+            tab: "Findings",
+            field: "contractVersion",
+            reason: "versionar la proyección normalizada y mantener compatibilidad explícita",
+        },
+        SchemaColumnAddition {
+            tab: "Investigations",
+            field: "coverageStatus",
+            reason: "evitar que una cobertura parcial parezca una investigación limpia",
+        },
+        SchemaColumnAddition {
+            tab: "Investigations",
+            field: "failClosed",
+            reason: "transportar el bloqueo de cobertura al registro derivado",
+        },
+        SchemaColumnAddition {
+            tab: "Investigations",
+            field: "contractVersion",
+            reason: "versionar la investigación derivada del monitor",
+        },
+        SchemaColumnAddition {
+            tab: "Recommendations",
+            field: "sourceKind",
+            reason: "mantener la procedencia multicloud de la recomendación",
+        },
+        SchemaColumnAddition {
+            tab: "Recommendations",
+            field: "links",
+            reason: "conservar únicamente enlaces estáticos allowlisted para revisión humana",
+        },
+        SchemaColumnAddition {
+            tab: "Recommendations",
+            field: "contractVersion",
+            reason: "versionar la recomendación sin cambiar su estado propuesto",
+        },
+    ]
+}
+
+fn build_sheets_manifest(plan: &MonitorSyncPlan) -> SheetsManifest {
+    SheetsManifest {
+        phase: "sheet_mutations_before_notification",
+        external_writes_allowed: false,
+        tab_order: vec!["Findings", "Investigations", "Recommendations"],
+        operation_order: vec!["create", "update", "noop", "suppress"],
+        tabs: vec![
+            build_sheet_tab("Findings", "eventId", FINDINGS_RANGE, &plan.findings),
+            build_sheet_tab(
+                "Investigations",
+                "investigationId",
+                INVESTIGATIONS_RANGE,
+                &plan.investigations,
+            ),
+            build_sheet_tab(
+                "Recommendations",
+                "recommendationId",
+                RECOMMENDATIONS_RANGE,
+                &plan.recommendations,
+            ),
+        ],
+    }
+}
+
+fn build_sheet_tab(
+    name: &'static str,
+    key_field: &'static str,
+    range: &'static str,
+    operations: &[SyncOperation],
+) -> SheetTabManifest {
+    let mut ordered = operations.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        sync_action_rank(left.action)
+            .cmp(&sync_action_rank(right.action))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let operations = ordered
+        .into_iter()
+        .map(|operation| SheetOperation {
+            action: operation.action,
+            key: operation.key.clone(),
+            eligible: operation.eligible,
+            reason: operation.reason.clone(),
+            lookup: SheetLookup {
+                range,
+                key_field,
+                key: operation.key.clone(),
+            },
+            record: operation.record.clone(),
+            patch: operation.patch.clone(),
+            preserved_human_fields: operation.preserved_human_fields.clone(),
+        })
+        .collect();
+    SheetTabManifest {
+        name,
+        key_field,
+        range,
+        lookup_range: range,
+        operations,
+    }
+}
+
+fn sync_action_rank(action: SyncAction) -> u8 {
+    match action {
+        SyncAction::Create => 0,
+        SyncAction::Update => 1,
+        SyncAction::Noop => 2,
+        SyncAction::Suppress => 3,
+    }
+}
+
+fn build_readback_manifest(plan: &MonitorSyncPlan) -> ReadbackManifest {
+    let mut assertions = Vec::new();
+    append_readback_assertions(
+        &mut assertions,
+        "Findings",
+        "eventId",
+        FINDINGS_RANGE,
+        &plan.findings,
+    );
+    append_readback_assertions(
+        &mut assertions,
+        "Investigations",
+        "investigationId",
+        INVESTIGATIONS_RANGE,
+        &plan.investigations,
+    );
+    append_readback_assertions(
+        &mut assertions,
+        "Recommendations",
+        "recommendationId",
+        RECOMMENDATIONS_RANGE,
+        &plan.recommendations,
+    );
+    ReadbackManifest {
+        phase: "required_after_sheet_mutations",
+        executed: false,
+        success: false,
+        assertions,
+        on_failure: "block_notification_and_restore_from_backup",
+    }
+}
+
+fn append_readback_assertions(
+    assertions: &mut Vec<ReadbackAssertion>,
+    tab: &'static str,
+    key_field: &'static str,
+    range: &'static str,
+    operations: &[SyncOperation],
+) {
+    let mut ordered = operations.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        sync_action_rank(left.action)
+            .cmp(&sync_action_rank(right.action))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    assertions.extend(ordered.into_iter().map(|operation| ReadbackAssertion {
+        tab,
+        range,
+        key_field,
+        key: operation.key.clone(),
+        action: operation.action,
+        expected_machine_record: operation.record.clone(),
+        preserved_human_fields: HUMAN_FIELDS.to_vec(),
+    }));
+}
+
+fn build_notification_manifest(plan: &MonitorSyncPlan) -> NotificationManifest {
+    NotificationManifest {
+        phase: "after_readback",
+        action: NotifierAction::Suppress,
+        effective: NotifierAction::Suppress,
+        candidate_action: plan.email.candidate_action,
+        eligible: false,
+        recipient_policy: "fixed",
+        recipients: NOTIFICATION_RECIPIENTS
+            .iter()
+            .map(|recipient| (*recipient).to_string())
+            .collect(),
+        requires_readback_success: true,
+        authorization_required: true,
+        reason: if plan.gate.schema_compatible
+            && plan.gate.coverage_complete
+            && plan.gate.required_coverage_complete
+            && !plan.gate.fail_closed
+        {
+            "notification_requires_successful_readback_and_human_authorization"
+        } else {
+            "notification_blocked_by_cutover_gate"
+        },
+        payload: plan.email.payload.clone(),
+    }
 }
 
 fn validate_contract(contract: &RawContract) -> Result<(), CutoverError> {
@@ -945,6 +1860,7 @@ fn index_existing(
 ) -> Result<BTreeMap<String, BTreeMap<String, Value>>, CutoverError> {
     let mut indexed = BTreeMap::new();
     for record in records {
+        validate_existing_record(&record, key_field, collection)?;
         let key = record
             .get(key_field)
             .and_then(Value::as_str)
@@ -963,6 +1879,48 @@ fn index_existing(
         }
     }
     Ok(indexed)
+}
+
+fn validate_existing_record(
+    record: &BTreeMap<String, Value>,
+    key_field: &str,
+    collection: &str,
+) -> Result<(), CutoverError> {
+    if record.contains_key("action") {
+        return Err(CutoverError::invalid(format!(
+            "ambiguous target action in {collection} row"
+        )));
+    }
+    if let Some(alias) = record.get("key") {
+        if alias.as_str() != record.get(key_field).and_then(Value::as_str) {
+            return Err(CutoverError::invalid(format!(
+                "ambiguous target key in {collection} row"
+            )));
+        }
+    }
+    for (field, value) in record {
+        if field == "links" {
+            validate_target_links(value)?;
+        } else if HUMAN_FIELDS.contains(&field.as_str()) {
+            validate_preserved_value(value)?;
+        } else {
+            validate_existing_value(field, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_value(field: &str, value: &Value) -> Result<(), CutoverError> {
+    match value {
+        Value::String(text) => validate_text(field, text, 4_000),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| validate_existing_value(field, item)),
+        Value::Object(fields) => fields
+            .values()
+            .try_for_each(|item| validate_existing_value(field, item)),
+        _ => Ok(()),
+    }
 }
 
 fn plan_records(
@@ -1076,11 +2034,21 @@ fn preserved_human_fields(
     let mut preserved = BTreeMap::new();
     for field in HUMAN_FIELDS {
         if let Some(value) = record.get(*field) {
-            validate_preserved_value(value)?;
+            if *field == "links" {
+                validate_target_links(value)?;
+            } else {
+                validate_preserved_value(value)?;
+            }
             preserved.insert((*field).to_string(), value.clone());
         }
     }
     Ok(preserved)
+}
+
+fn validate_target_links(value: &Value) -> Result<(), CutoverError> {
+    let links: Vec<RawLink> = serde_json::from_value(value.clone())
+        .map_err(|_| CutoverError::invalid("existing links have an invalid shape"))?;
+    validate_links(&links)
 }
 
 fn validate_preserved_value(value: &Value) -> Result<(), CutoverError> {
@@ -1586,6 +2554,11 @@ mod tests {
             .expect("plan should serialize")
     }
 
+    fn bundle_value(report: Value, target: Value) -> Value {
+        serde_json::to_value(build_cutover_bundle(&report, &target).expect("bundle should build"))
+            .expect("bundle should serialize")
+    }
+
     fn first_operation<'a>(plan: &'a Value, collection: &str) -> &'a Value {
         plan.get(collection)
             .and_then(Value::as_array)
@@ -1621,7 +2594,8 @@ mod tests {
         assert_eq!(plan["recommendations"][0]["action"], "create");
         assert_eq!(plan["recommendations"][0]["key"], RECOMMENDATION_ID);
         assert_eq!(plan["email"]["action"], "suppress");
-        assert_eq!(plan["email"]["eligible"], true);
+        assert_eq!(plan["email"]["eligible"], false);
+        assert_eq!(plan["email"]["candidateEligible"], true);
         assert_eq!(
             plan["email"]["payload"]["formatVersion"],
             "security_intelligence_monitor_v1"
@@ -1892,5 +2866,287 @@ mod tests {
             .expect("recommendations")
             .is_empty());
         assert_eq!(plan["email"]["action"], "suppress");
+    }
+
+    #[test]
+    fn compiles_a_stable_bundle_with_fingerprints_preconditions_and_additive_migration() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let first = bundle_value(input.clone(), empty_target(7));
+        let second = bundle_value(input, empty_target(7));
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first["bundleVersion"],
+            "security_intelligence_monitor_cutover_bundle_v1"
+        );
+        assert_eq!(
+            first["fingerprints"]["algorithm"],
+            "sha256-canonical-json-v1"
+        );
+        assert!(first["fingerprints"]["input"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(first["fingerprints"]["target"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert_eq!(first["preconditions"]["mode"]["expected"], "read-only");
+        assert_eq!(first["preconditions"]["schema"]["expected"], 7);
+        assert_eq!(first["migration"]["mode"], "additive_only");
+        assert_eq!(first["migration"]["fromVersion"], 6);
+        assert_eq!(first["migration"]["toVersion"], 7);
+        assert_eq!(first["migration"]["externalWritesAllowed"], false);
+        assert!(first["migration"]["additions"]
+            .as_array()
+            .expect("migration additions")
+            .iter()
+            .any(|addition| addition["tab"] == "Findings" && addition["field"] == "sourceKind"));
+        assert!(first["migration"]["forbiddenOperations"]
+            .as_array()
+            .expect("forbidden migration operations")
+            .iter()
+            .any(|operation| operation == "delete_columns"));
+        assert_eq!(first["noEffect"]["sheetsWritesPerformed"], false);
+        assert_eq!(first["noEffect"]["emailSent"], false);
+    }
+
+    #[test]
+    fn groups_exact_key_sheet_operations_and_requires_readback_before_notification() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let bundle = bundle_value(input, empty_target(7));
+
+        let tabs = bundle["sheets"]["tabs"].as_array().expect("sheet tabs");
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| tab["name"].as_str().expect("tab name"))
+                .collect::<Vec<_>>(),
+            vec!["Findings", "Investigations", "Recommendations"]
+        );
+        assert_eq!(tabs[0]["keyField"], "eventId");
+        assert_eq!(tabs[0]["operations"][0]["key"], EVENT_ID);
+        assert_eq!(tabs[0]["operations"][0]["lookup"]["key"], EVENT_ID);
+        assert_eq!(bundle["readback"]["executed"], false);
+        assert_eq!(bundle["readback"]["success"], false);
+        assert_eq!(bundle["readback"]["assertions"][0]["key"], EVENT_ID);
+        assert_eq!(
+            bundle["readback"]["assertions"][0]["range"],
+            "Findings!A:AB"
+        );
+        assert_eq!(bundle["notification"]["phase"], "after_readback");
+        assert_eq!(bundle["notification"]["action"], "suppress");
+        assert_eq!(bundle["notification"]["effective"], "suppress");
+        assert_eq!(bundle["notifier"]["effective"], "suppress");
+        assert_eq!(bundle["notification"]["eligible"], false);
+        assert_eq!(bundle["notification"]["candidateAction"], "emit");
+        assert_eq!(
+            bundle["notification"]["recipients"],
+            json!(["security-operations@example.com"])
+        );
+    }
+
+    #[test]
+    fn schema_six_is_blocked_and_schema_seven_is_only_engineering_ready() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let blocked = bundle_value(input.clone(), empty_target(6));
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["migration"]["status"], "blocked_current_schema");
+        assert_eq!(blocked["sheets"]["externalWritesAllowed"], false);
+        assert_eq!(blocked["notification"]["action"], "suppress");
+
+        let compatible = bundle_value(input, empty_target(7));
+        assert_eq!(compatible["status"], "eligible_pending_authorization");
+        assert_eq!(compatible["migration"]["status"], "target_already_schema_7");
+        assert_eq!(compatible["gate"]["authorizationRequired"], true);
+        assert_eq!(compatible["externalWritesAllowed"], false);
+    }
+
+    #[test]
+    fn preserves_human_fields_and_emits_machine_patch_only() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let initial = bundle_value(input.clone(), empty_target(7));
+        let mut existing_finding = initial["findings"][0]["record"].clone();
+        existing_finding["quickView"] = json!("old machine projection");
+        existing_finding["status"] = json!("open");
+        existing_finding["reviewedBy"] = json!("reviewer@example.com");
+        existing_finding["notes"] = json!("Decisión humana pendiente");
+        existing_finding["links"] = json!([{"label": "Google Admin security", "url": "https://admin.google.com/ac/security"}]);
+        let target = json!({
+            "schemaVersion": 7,
+            "findings": [existing_finding],
+            "investigations": [],
+            "recommendations": []
+        });
+
+        let bundle = bundle_value(input, target);
+        let operation = &bundle["sheets"]["tabs"][0]["operations"][0];
+        assert_eq!(operation["action"], "update");
+        assert_eq!(
+            operation["patch"]["quickView"],
+            "Administrador activo sin 2SV: Google informa una cuenta habilitada."
+        );
+        assert!(operation["patch"].get("notes").is_none());
+        assert_eq!(
+            operation["preservedHumanFields"]["reviewedBy"],
+            "reviewer@example.com"
+        );
+        assert_eq!(
+            operation["preservedHumanFields"]["notes"],
+            "Decisión humana pendiente"
+        );
+        assert_eq!(
+            operation["preservedHumanFields"]["links"][0]["label"],
+            "Google Admin security"
+        );
+    }
+
+    #[test]
+    fn rejects_stale_snapshot_hash_and_capacity_overflow() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let mut stale = empty_target(7);
+        stale["snapshot"] = json!({
+            "revision": "sheet-revision-4",
+            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        let stale_error = build_cutover_bundle(&input, &stale)
+            .expect_err("stale snapshot must fail closed")
+            .to_string();
+        assert!(stale_error.contains("stale target snapshot"));
+
+        let mut overflow = empty_target(7);
+        overflow["capacity"] = json!({"findings": 0, "investigations": 10, "recommendations": 10});
+        let overflow_error = build_cutover_bundle(&input, &overflow)
+            .expect_err("capacity overflow must fail closed")
+            .to_string();
+        assert!(overflow_error.contains("findings capacity"));
+    }
+
+    #[test]
+    fn canonical_fingerprints_ignore_input_and_target_collection_order() {
+        let mut first = report(
+            vec![finding(EVENT_ID), finding(SECOND_EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID, SECOND_EVENT_ID])],
+        );
+        first["monitorIntegration"]["security_intelligence_monitor_v1"]["email"]["blocks"]
+            .as_array_mut()
+            .expect("email blocks")
+            .push(email_block(SECOND_EVENT_ID));
+        let mut second = first.clone();
+        second["monitorIntegration"]["security_intelligence_monitor_v1"]["findings"]
+            .as_array_mut()
+            .expect("findings")
+            .reverse();
+        second["monitorIntegration"]["security_intelligence_monitor_v1"]["email"]["blocks"]
+            .as_array_mut()
+            .expect("email blocks")
+            .reverse();
+
+        let first_target = json!({
+            "schemaVersion": 7,
+            "findings": [{"eventId": EVENT_ID}, {"eventId": SECOND_EVENT_ID}],
+            "investigations": [],
+            "recommendations": []
+        });
+        let second_target = json!({
+            "schemaVersion": 7,
+            "findings": [{"eventId": SECOND_EVENT_ID}, {"eventId": EVENT_ID}],
+            "investigations": [],
+            "recommendations": []
+        });
+
+        let first_bundle = bundle_value(first, first_target);
+        let second_bundle = bundle_value(second, second_target);
+        assert_eq!(first_bundle["fingerprints"], second_bundle["fingerprints"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_existing_machine_values_and_ambiguous_actions() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let mut unsafe_target = empty_target(7);
+        unsafe_target["findings"] = json!([{
+            "eventId": EVENT_ID,
+            "source": "=IMPORTDATA(\"https://evil.example\")"
+        }]);
+        let unsafe_error = build_cutover_bundle(&input, &unsafe_target)
+            .expect_err("unsafe existing value must fail closed")
+            .to_string();
+        assert!(unsafe_error.contains("unsafe formula"));
+
+        let mut ambiguous_target = empty_target(7);
+        ambiguous_target["findings"] = json!([{
+            "eventId": EVENT_ID,
+            "action": "merge"
+        }]);
+        let ambiguous_error = build_cutover_bundle(&input, &ambiguous_target)
+            .expect_err("ambiguous target action must fail closed")
+            .to_string();
+        assert!(ambiguous_error.contains("ambiguous target action"));
+    }
+
+    #[test]
+    fn carries_a_matching_snapshot_revision_as_an_exact_precondition() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let mut target = empty_target(7);
+        let input_fingerprint = fingerprint_value(&input);
+        let target_fingerprint = target_state_fingerprint(&target).expect("target fingerprint");
+        target["snapshot"] = json!({
+            "revision": "sheet-revision-4",
+            "etag": "etag-4",
+            "capturedAt": "2026-08-01T15:01:00Z",
+            "stateFingerprint": target_fingerprint,
+            "inputFingerprint": input_fingerprint
+        });
+
+        let bundle = bundle_value(input, target);
+        assert_eq!(
+            bundle["preconditions"]["snapshot"]["revision"],
+            "sheet-revision-4"
+        );
+        assert_eq!(bundle["preconditions"]["snapshot"]["etag"], "etag-4");
+        assert_eq!(bundle["preconditions"]["snapshot"]["satisfied"], true);
+    }
+
+    #[test]
+    fn compiles_empty_input_without_creating_or_notifying() {
+        let mut input = report(Vec::new(), Vec::new());
+        input["monitorIntegration"]["security_intelligence_monitor_v1"]["email"]["blocks"] =
+            json!([]);
+
+        let bundle = bundle_value(input, empty_target(7));
+        assert!(bundle["findings"].as_array().expect("findings").is_empty());
+        assert!(bundle["investigations"]
+            .as_array()
+            .expect("investigations")
+            .is_empty());
+        assert!(bundle["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .is_empty());
+        assert!(bundle["readback"]["assertions"]
+            .as_array()
+            .expect("readback assertions")
+            .is_empty());
+        assert_eq!(bundle["notification"]["effective"], "suppress");
     }
 }

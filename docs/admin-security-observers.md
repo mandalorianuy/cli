@@ -345,7 +345,7 @@ happened; a recommendation records a proposed human decision. Recommended
 states are `proposed`, `accepted`, `rejected`, and `implemented`. The observer
 never changes a recommendation state and never applies a DLP or sharing rule.
 
-### Controlled cutover planner (T3)
+### Controlled cutover planner and bundle compiler (T3/T3b)
 
 `+security-monitor-plan` is a local, deterministic planner for a later
 synchronizer. It accepts a complete read-only observer report plus a local
@@ -353,12 +353,23 @@ monitor-target snapshot and emits bounded `create`, `update`, `noop`, and
 `suppress` operations. It never calls Sheets, Gmail, Google Admin, Microsoft
 Graph, or another writer, and it requires `--dry-run`.
 
+The compiled `security_intelligence_monitor_cutover_bundle_v1` adds canonical
+input/target fingerprints, exact preconditions, an additive schema manifest,
+ordered Sheet request manifests, per-key readback assertions, rollback/no-effect
+instructions, and a separate notification phase. Notification remains
+suppressed until a separately authorized writer completes exact readback.
+
 Only the additive target `schemaVersion=7` is eligible for planning. Version 6
 and incomplete coverage remain blocked with `externalWritesAllowed=false`.
 Human-owned status, disposition, notes, owner, reviewer, decision, and
 resolution fields are never included in an automatic patch. Conflicting
 duplicates, unknown sources, non-allowlisted URLs, formula-like values, and
 unknown recommendation references fail closed.
+
+Optional `stateFingerprint` and `inputFingerprint` guards reject stale local
+snapshots. The bundle keeps `sheets.externalWritesAllowed=false`,
+`notification.effective=suppress`, and all no-effect flags false for writes and
+delivery. It cannot create tabs, update cells, send email, or mutate credentials.
 
 ```bash
 gws admin-reports +security-monitor-plan \

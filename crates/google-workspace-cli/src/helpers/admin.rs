@@ -1065,7 +1065,7 @@ fn build_security_observer_cmd() -> Command {
 
 fn build_security_monitor_plan_cmd() -> Command {
     Command::new("+security-monitor-plan")
-        .about("[Helper] Validate a Security Intelligence Monitor cutover without external effects")
+        .about("[Helper] Compile a Security Intelligence Monitor cutover bundle without external effects")
         .arg(
             Arg::new("input")
                 .long("input")
@@ -1078,13 +1078,13 @@ fn build_security_monitor_plan_cmd() -> Command {
                 .long("existing")
                 .required(true)
                 .value_name("FILE")
-                .help("Local monitor target snapshot with schemaVersion and current records"),
+                .help("Local monitor target snapshot with schemaVersion, records, and optional revision/hash guards"),
         )
         .arg(
             Arg::new("dry-run")
                 .long("dry-run")
                 .action(ArgAction::SetTrue)
-                .help("Required: emit a local plan only; never write a Sheet or send email"),
+                .help("Required: emit a local bundle only; never write a Sheet or send email"),
         )
         .arg(
             Arg::new("format")
@@ -1094,7 +1094,7 @@ fn build_security_monitor_plan_cmd() -> Command {
                 .value_name("FORMAT"),
         )
         .after_help(
-            "NO-EFFECT GUARANTEE:\n  Reads only the two local JSON files.\n  The command never calls Google Sheets, Gmail, Microsoft Graph, or any writer.\n  A schema or coverage gate failure is represented as blocked in the plan.",
+            "NO-EFFECT GUARANTEE:\n  Reads only the two local JSON files.\n  The command never calls Google Sheets, Gmail, Microsoft Graph, or any writer.\n  A schema or coverage gate failure is represented as blocked in the bundle.\n  The notification phase is always suppressed until a separately authorized writer completes readback.",
         )
 }
 
@@ -1573,11 +1573,12 @@ fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
         .expect("existing is required by clap");
     let input = read_monitor_plan_json(input_path, "--input")?;
     let existing = read_monitor_plan_json(existing_path, "--existing")?;
-    let plan = monitor_cutover::build_sync_plan(&input, &existing)
-        .map_err(|error| GwsError::Validation(format!("Monitor cutover plan rejected: {error}")))?;
-    let value = serde_json::to_value(plan).map_err(|error| {
+    let bundle = monitor_cutover::build_cutover_bundle(&input, &existing).map_err(|error| {
+        GwsError::Validation(format!("Monitor cutover bundle rejected: {error}"))
+    })?;
+    let value = serde_json::to_value(bundle).map_err(|error| {
         GwsError::Other(anyhow::anyhow!(
-            "Could not serialize monitor cutover plan: {error}"
+            "Could not serialize monitor cutover bundle: {error}"
         ))
     })?;
     let output_format = matches

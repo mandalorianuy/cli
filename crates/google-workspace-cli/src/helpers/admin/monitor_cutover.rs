@@ -744,7 +744,7 @@ pub(super) fn build_cutover_bundle(
     let snapshot = validate_snapshot_metadata(&existing, &input_fingerprint, &target_fingerprint)?;
     let input_counts = normalized_input_counts(input)?;
     let plan = build_sync_plan(input, target)?;
-    let capacity = build_capacity_precondition(&input_counts, &existing)?;
+    let capacity = build_capacity_precondition(&input_counts, &existing, &plan)?;
     let migration = build_migration_manifest(plan.observed_target_schema_version);
     let sheets = build_sheets_manifest(&plan);
     let readback = build_readback_manifest(&plan);
@@ -753,7 +753,7 @@ pub(super) fn build_cutover_bundle(
         strategy: "retain_target_snapshot_and_discard_local_bundle",
         external_writes_performed: false,
         target_fingerprint: target_fingerprint.clone(),
-        target_revision: merged_snapshot(&existing).and_then(|snapshot| snapshot.revision),
+        target_revision: merged_snapshot(&existing)?.and_then(|snapshot| snapshot.revision),
         steps: vec![
             "do_not_apply_external_writes_from_this_bundle",
             "retain_original_target_snapshot",
@@ -901,7 +901,7 @@ fn validate_snapshot_metadata(
     input_fingerprint: &str,
     target_fingerprint: &str,
 ) -> Result<Option<SnapshotPrecondition>, CutoverError> {
-    let snapshot = merged_snapshot(existing);
+    let snapshot = merged_snapshot(existing)?;
     let expected_input_fingerprint = snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.input_fingerprint.as_deref())
@@ -947,7 +947,7 @@ fn validate_snapshot_metadata(
     }))
 }
 
-fn merged_snapshot(existing: &ExistingTarget) -> Option<RawSnapshot> {
+fn merged_snapshot(existing: &ExistingTarget) -> Result<Option<RawSnapshot>, CutoverError> {
     let mut snapshot = existing.snapshot.clone().unwrap_or(RawSnapshot {
         revision: None,
         etag: None,
@@ -955,14 +955,19 @@ fn merged_snapshot(existing: &ExistingTarget) -> Option<RawSnapshot> {
         state_fingerprint: None,
         input_fingerprint: None,
     });
-    snapshot.revision = snapshot.revision.or_else(|| existing.revision.clone());
-    snapshot.etag = snapshot.etag.or_else(|| existing.etag.clone());
-    snapshot.state_fingerprint = snapshot
-        .state_fingerprint
-        .or_else(|| existing.state_fingerprint.clone());
-    if snapshot.input_fingerprint.is_none() {
-        snapshot.input_fingerprint = existing.expected_input_fingerprint.clone();
-    }
+    snapshot.revision =
+        merge_snapshot_guard("revision", snapshot.revision, existing.revision.clone())?;
+    snapshot.etag = merge_snapshot_guard("etag", snapshot.etag, existing.etag.clone())?;
+    snapshot.state_fingerprint = merge_snapshot_guard(
+        "state fingerprint",
+        snapshot.state_fingerprint,
+        existing.state_fingerprint.clone(),
+    )?;
+    snapshot.input_fingerprint = merge_snapshot_guard(
+        "input fingerprint",
+        snapshot.input_fingerprint,
+        existing.expected_input_fingerprint.clone(),
+    )?;
     if snapshot.revision.is_none()
         && snapshot.etag.is_none()
         && snapshot.captured_at.is_none()
@@ -970,9 +975,23 @@ fn merged_snapshot(existing: &ExistingTarget) -> Option<RawSnapshot> {
         && snapshot.input_fingerprint.is_none()
         && existing.snapshot.is_none()
     {
-        None
+        Ok(None)
     } else {
-        Some(snapshot)
+        Ok(Some(snapshot))
+    }
+}
+
+fn merge_snapshot_guard(
+    field: &str,
+    nested: Option<String>,
+    top_level: Option<String>,
+) -> Result<Option<String>, CutoverError> {
+    match (nested, top_level) {
+        (Some(nested), Some(top_level)) if nested != top_level => Err(CutoverError::invalid(
+            format!("conflicting snapshot {field} guards"),
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -1032,6 +1051,7 @@ fn build_id_precondition(
 fn build_capacity_precondition(
     input_counts: &BTreeMap<String, usize>,
     existing: &ExistingTarget,
+    plan: &MonitorSyncPlan,
 ) -> Result<CapacityPrecondition, CutoverError> {
     let configured = existing.capacity.as_ref();
     let limits = BTreeMap::from([
@@ -1071,12 +1091,17 @@ fn build_capacity_precondition(
     let mut requested_cells = BTreeMap::new();
     for collection in ["findings", "investigations", "recommendations"] {
         let limit = limits[collection];
-        if limit > MAX_ROWS_PER_TAB {
+        if limit == 0 || limit > MAX_ROWS_PER_TAB {
             return Err(CutoverError::invalid(format!(
                 "{collection} capacity exceeds safety limit"
             )));
         }
-        let rows = requested_rows[collection].max(target_rows[collection]);
+        let rows = match collection {
+            "findings" => plan.findings.len(),
+            "investigations" => plan.investigations.len(),
+            "recommendations" => plan.recommendations.len(),
+            _ => unreachable!(),
+        };
         if rows > limit {
             return Err(CutoverError::invalid(format!(
                 "{collection} capacity overflow"
@@ -1471,6 +1496,7 @@ fn validate_finding(finding: &RawFinding) -> Result<(), CutoverError> {
         if !valid_email(actor) {
             return Err(CutoverError::invalid("invalid minimized actor"));
         }
+        validate_text("actor", actor, 254)?;
     }
     validate_text("quickView", &finding.quick_view, 300)?;
     validate_text("whyFlagged", &finding.why_flagged, 1_200)?;
@@ -2813,6 +2839,17 @@ mod tests {
             .expect_err("unknown recommendation reference must fail closed")
             .to_string()
             .contains("unknown finding eventId"));
+
+        let mut formula_actor = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        formula_actor["monitorIntegration"]["security_intelligence_monitor_v1"]["findings"][0]
+            ["actor"] = json!("=IMPORTDATA@example.com");
+        assert!(build_sync_plan(&formula_actor, &empty_target(7))
+            .expect_err("formula-like actor must fail closed before projection")
+            .to_string()
+            .contains("actor"));
     }
 
     #[test]
@@ -3026,6 +3063,45 @@ mod tests {
             .expect_err("capacity overflow must fail closed")
             .to_string();
         assert!(overflow_error.contains("findings capacity"));
+    }
+
+    #[test]
+    fn rejects_union_capacity_overflow_for_disjoint_target_and_input_keys() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let target = json!({
+            "schemaVersion": 7,
+            "findings": [
+                {"eventId": SECOND_EVENT_ID},
+                {"eventId": "simv1-event-00000000-0000-0000-0000-000000000003"}
+            ],
+            "investigations": [],
+            "recommendations": [],
+            "capacity": {"findings": 2, "investigations": 10, "recommendations": 10}
+        });
+
+        let error = build_cutover_bundle(&input, &target)
+            .expect_err("the target/input union must not exceed tab capacity")
+            .to_string();
+        assert!(error.contains("findings capacity"));
+    }
+
+    #[test]
+    fn rejects_conflicting_nested_and_top_level_snapshot_guards() {
+        let input = report(
+            vec![finding(EVENT_ID)],
+            vec![recommendation(vec![EVENT_ID])],
+        );
+        let mut target = empty_target(7);
+        target["snapshot"] = json!({"revision": "nested-revision"});
+        target["revision"] = json!("top-level-revision");
+
+        let error = build_cutover_bundle(&input, &target)
+            .expect_err("conflicting snapshot guards must fail closed")
+            .to_string();
+        assert!(error.contains("conflicting"));
     }
 
     #[test]

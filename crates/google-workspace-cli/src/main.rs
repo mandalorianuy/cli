@@ -148,10 +148,17 @@ async fn run() -> Result<(), GwsError> {
     let (api_name, version) = parse_service_and_version(&args, &first_arg)?;
 
     // For synthetic services (no Discovery doc), use an empty RestDescription
-    let doc = if api_name == "workflow" {
+    let doc = if api_name == "workflow"
+        || is_local_security_monitor_command(&args, &first_arg, &api_name)
+    {
         discovery::RestDescription {
-            name: "workflow".to_string(),
-            description: Some("Cross-service productivity workflows".to_string()),
+            name: api_name.clone(),
+            description: if api_name == "workflow" {
+                Some("Cross-service productivity workflows".to_string())
+            } else {
+                Some("Local Security Intelligence Monitor helpers".to_string())
+            },
+            version: version.clone(),
             ..Default::default()
         }
     } else {
@@ -349,6 +356,40 @@ pub fn parse_service_and_version(
     let (api_name, default_version) = services::resolve_service(service_arg)?;
     let version = version_override.unwrap_or(default_version);
     Ok((api_name, version))
+}
+
+fn is_local_security_monitor_command(args: &[String], service_arg: &str, api_name: &str) -> bool {
+    let Some(service_index) = args.iter().position(|arg| arg == service_arg) else {
+        return false;
+    };
+
+    if api_name != "admin" {
+        return false;
+    }
+
+    let mut skip_next = false;
+    for arg in args.iter().skip(service_index + 1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(arg.as_str(), "--api-version" | "--format" | "--sanitize") {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--api-version=")
+            || arg.starts_with("--format=")
+            || arg.starts_with("--sanitize=")
+            || arg.starts_with('-')
+        {
+            continue;
+        }
+        return matches!(
+            arg.as_str(),
+            "+security-monitor-plan" | "+security-monitor-program"
+        );
+    }
+    false
 }
 
 pub fn filter_args_for_subcommand(args: &[String], service_name: &str) -> Vec<String> {
@@ -556,6 +597,73 @@ mod tests {
         assert_eq!(config.page_all, false);
         assert_eq!(config.page_limit, 10);
         assert_eq!(config.page_delay_ms, 100);
+    }
+
+    #[test]
+    fn security_monitor_helpers_bypass_external_discovery() {
+        let plan_args = vec![
+            "gws".to_string(),
+            "admin-reports".to_string(),
+            "+security-monitor-plan".to_string(),
+        ];
+        assert!(is_local_security_monitor_command(
+            &plan_args,
+            "admin-reports",
+            "admin"
+        ));
+
+        let program_args = vec![
+            "gws".to_string(),
+            "reports".to_string(),
+            "+security-monitor-program".to_string(),
+        ];
+        assert!(is_local_security_monitor_command(
+            &program_args,
+            "reports",
+            "admin"
+        ));
+
+        let resource_args = vec![
+            "gws".to_string(),
+            "admin-reports".to_string(),
+            "activities".to_string(),
+        ];
+        assert!(!is_local_security_monitor_command(
+            &resource_args,
+            "admin-reports",
+            "admin"
+        ));
+        assert!(!is_local_security_monitor_command(
+            &plan_args,
+            "admin-reports",
+            "sheets"
+        ));
+
+        let global_flag_args = vec![
+            "gws".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "admin-reports".to_string(),
+            "+security-monitor-plan".to_string(),
+        ];
+        assert!(is_local_security_monitor_command(
+            &global_flag_args,
+            "admin-reports",
+            "admin"
+        ));
+
+        let misleading_value_args = vec![
+            "gws".to_string(),
+            "admin-reports".to_string(),
+            "+admin-observer".to_string(),
+            "--customer".to_string(),
+            "+security-monitor-plan".to_string(),
+        ];
+        assert!(!is_local_security_monitor_command(
+            &misleading_value_args,
+            "admin-reports",
+            "admin"
+        ));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use uuid::Uuid;
 
 const PROGRAM_VERSION: &str = "security_intelligence_monitor_execution_program_v1";
 const RECEIPT_VERSION: &str = "security_intelligence_monitor_execution_receipt_v1";
@@ -29,20 +30,43 @@ const MAX_POLICY_OPERATIONS: usize = 30_000;
 const MAX_POLICY_ID_LENGTH: usize = 128;
 const MAX_SPREADSHEET_ID_LENGTH: usize = 200;
 const MAX_TENANT_ID_LENGTH: usize = 253;
+const EXPECTED_SCHEMA_ADDITIONS: &[(&str, &str)] = &[
+    ("Findings", "sourceKind"),
+    ("Findings", "eventTime"),
+    ("Findings", "rawSeverity"),
+    ("Findings", "contextualVerdict"),
+    ("Findings", "assertionsFact"),
+    ("Findings", "assertionsInference"),
+    ("Findings", "assertionsMissingData"),
+    ("Findings", "contractVersion"),
+    ("Investigations", "coverageStatus"),
+    ("Investigations", "failClosed"),
+    ("Investigations", "contractVersion"),
+    ("Recommendations", "sourceKind"),
+    ("Recommendations", "links"),
+    ("Recommendations", "contractVersion"),
+];
 const HUMAN_FIELDS: &[&str] = &[
     "assignee",
     "comment",
+    "comments",
     "decision",
+    "decisionAt",
     "disposition",
     "email",
     "emailDisposition",
     "emailSentAt",
     "emailStatus",
+    "humanDisposition",
+    "humanStatus",
     "links",
     "notes",
     "notificationStatus",
     "owner",
+    "resolution",
     "reviewedBy",
+    "reviewedAt",
+    "reviewer",
     "status",
 ];
 const ALLOWED_URLS: &[&str] = &[
@@ -94,11 +118,21 @@ impl std::error::Error for ProgramError {}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BundleInput {
+    plan_version: String,
     bundle_version: String,
     mode: String,
+    contract_version: String,
+    target_schema_version: u64,
+    observed_target_schema_version: u64,
     status: String,
+    coverage_status: String,
     external_writes_allowed: bool,
     email_allowed: bool,
+    gate: BundleGate,
+    blocked_reasons: Vec<String>,
+    findings: Vec<BundlePlanOperation>,
+    investigations: Vec<BundlePlanOperation>,
+    recommendations: Vec<BundlePlanOperation>,
     fingerprints: BundleFingerprints,
     preconditions: BundlePreconditions,
     migration: BundleMigration,
@@ -106,8 +140,32 @@ struct BundleInput {
     readback: BundleReadback,
     rollback: BundleRollback,
     no_effect: BundleNoEffect,
+    email: BundleEmailOperation,
     notification: BundleNotification,
     notifier: BundleNotification,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleGate {
+    schema_compatible: bool,
+    coverage_complete: bool,
+    required_coverage_complete: bool,
+    fail_closed: bool,
+    authorization_required: bool,
+    blocked_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct BundlePlanOperation {
+    action: String,
+    key: String,
+    eligible: bool,
+    reason: String,
+    record: BTreeMap<String, Value>,
+    patch: BTreeMap<String, Value>,
+    preserved_human_fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -124,6 +182,8 @@ struct BundlePreconditions {
     mode: BundleModePrecondition,
     coverage: BundleCoveragePrecondition,
     schema: BundleSchemaPrecondition,
+    ids: BundleIdPrecondition,
+    capacity: BundleCapacityPrecondition,
     snapshot: Option<BundleSnapshotPrecondition>,
     authorization_required: bool,
     external_writes_allowed: bool,
@@ -152,6 +212,27 @@ struct BundleSchemaPrecondition {
     expected: u64,
     observed: u64,
     compatible: bool,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleIdPrecondition {
+    input_unique: bool,
+    target_unique: bool,
+    exact_key_fields: BTreeMap<String, String>,
+    input_counts: BTreeMap<String, usize>,
+    target_counts: BTreeMap<String, usize>,
+    satisfied: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleCapacityPrecondition {
+    limits: BTreeMap<String, usize>,
+    requested_rows: BTreeMap<String, usize>,
+    target_rows: BTreeMap<String, usize>,
+    requested_cells: BTreeMap<String, usize>,
     satisfied: bool,
 }
 
@@ -268,6 +349,17 @@ struct BundleNoEffect {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleEmailOperation {
+    action: String,
+    candidate_action: String,
+    candidate_eligible: bool,
+    eligible: bool,
+    reason: String,
+    payload: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct BundleNotification {
     action: String,
@@ -407,12 +499,14 @@ enum PhaseRequest {
         key_field: String,
         expected_target_fingerprint: String,
         expected_revision: Option<String>,
+        expected_etag: Option<String>,
         external_writes_allowed: bool,
         operations: Vec<WriteRequest>,
     },
     ExactReadback {
         expected_target_fingerprint: String,
         expected_revision: Option<String>,
+        expected_etag: Option<String>,
         assertions: Vec<ReadbackRequest>,
         notification_requires_success: bool,
     },
@@ -447,6 +541,7 @@ struct WriteRequest {
     preserved_human_fields: BTreeMap<String, Value>,
     expected_target_fingerprint: String,
     expected_revision: Option<String>,
+    expected_etag: Option<String>,
     external_write_performed: bool,
 }
 
@@ -507,7 +602,7 @@ struct StateTransition {
     receipt_phase: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SimulationInvariants {
     no_write_before_admission_and_backup: bool,
@@ -545,6 +640,7 @@ pub(super) fn compile_execution_program(
     let target = validate_target(target_value, &policy)?;
     validate_bundle(&bundle, &policy, &target, target_value)?;
     validate_operations(&bundle.sheets, &bundle.readback, &policy, &target)?;
+    validate_plan_projection(&bundle)?;
 
     let bundle_fingerprint = fingerprint_value(bundle_value);
     let policy_fingerprint = fingerprint_value(policy_value);
@@ -758,13 +854,34 @@ pub(super) fn verify_execution_receipts(
             "simulation violates no-effect boundary",
         ));
     }
+    if simulation.transitions.len() != simulation.receipts.len() {
+        return Err(ProgramError::invalid(
+            "state transition manifest length mismatch",
+        ));
+    }
 
     let mut previous_fingerprint = None;
+    let mut previous_state = "initial".to_string();
     let mut expected_program_index = 0usize;
     let mut saw_failure = false;
     for (index, receipt) in simulation.receipts.iter().enumerate() {
+        let transition = &simulation.transitions[index];
         if receipt.sequence != (index + 1) as u64 {
             return Err(ProgramError::invalid("receipt sequence is out of order"));
+        }
+        if transition.sequence != receipt.sequence
+            || transition.from != receipt.state_before
+            || transition.to != receipt.state_after
+            || transition.receipt_phase != receipt.phase
+        {
+            return Err(ProgramError::invalid(
+                "state transition manifest does not match receipts",
+            ));
+        }
+        if receipt.state_before != previous_state {
+            return Err(ProgramError::invalid(
+                "receipt state transition chain is broken",
+            ));
         }
         if receipt.receipt_version != RECEIPT_VERSION {
             return Err(ProgramError::invalid("unsupported receipt version"));
@@ -788,6 +905,37 @@ pub(super) fn verify_execution_receipts(
         let expected_receipt_fingerprint = receipt_fingerprint(receipt)?;
         if receipt.receipt_fingerprint.as_deref() != Some(expected_receipt_fingerprint.as_str()) {
             return Err(ProgramError::invalid("forged receipt fingerprint"));
+        }
+        let expected_state_after = if receipt.phase == "rollback" {
+            match receipt.status.as_str() {
+                "succeeded" => "rolled_back".to_string(),
+                "failed" => "rollback_failed".to_string(),
+                _ => {
+                    return Err(ProgramError::invalid(
+                        "rollback receipt has an invalid status",
+                    ))
+                }
+            }
+        } else if receipt.status == "failed" {
+            format!("{}_failed", receipt.phase)
+        } else if receipt.status == "succeeded"
+            || (receipt.phase == "notification_handoff" && receipt.status == "suppressed")
+        {
+            phase_success_state(&receipt.phase)
+        } else {
+            return Err(ProgramError::invalid("receipt has an invalid status"));
+        };
+        if receipt.state_after != expected_state_after {
+            return Err(ProgramError::invalid(
+                "receipt state transition target is invalid",
+            ));
+        }
+        let expected_readback_success =
+            receipt.phase == "exact_readback" && receipt.status == "succeeded";
+        if receipt.readback_assertions_succeeded != expected_readback_success {
+            return Err(ProgramError::invalid(
+                "receipt readback result is inconsistent",
+            ));
         }
         if receipt.phase == "rollback" {
             if !saw_failure || index + 1 != simulation.receipts.len() {
@@ -822,30 +970,65 @@ pub(super) fn verify_execution_receipts(
             expected_program_index += 1;
         }
         previous_fingerprint = receipt.receipt_fingerprint.clone();
+        previous_state = receipt.state_after.clone();
     }
     if !saw_failure && expected_program_index != program.phases.len() {
         return Err(ProgramError::invalid(
             "simulation is missing phase receipts",
         ));
     }
-    if saw_failure && simulation.status == "completed" {
-        return Err(ProgramError::invalid("failed simulation claims completion"));
+    if simulation.final_state != previous_state {
+        return Err(ProgramError::invalid(
+            "simulation final state does not match receipt chain",
+        ));
     }
-    if !saw_failure && simulation.status != "completed" {
+    if saw_failure {
+        let rollback = simulation
+            .receipts
+            .last()
+            .ok_or_else(|| ProgramError::invalid("failed simulation is missing rollback"))?;
+        let expected = match rollback.status.as_str() {
+            "succeeded" => ("rolled_back", "rolled_back"),
+            "failed" => ("blocked_rollback_failure", "rollback_failed"),
+            _ => unreachable!("rollback status validated above"),
+        };
+        if simulation.status != expected.0 || simulation.final_state != expected.1 {
+            return Err(ProgramError::invalid(
+                "failed simulation status does not match rollback",
+            ));
+        }
+    } else if simulation.status != "completed" {
         return Err(ProgramError::invalid(
             "successful simulation has invalid status",
         ));
     }
-    if !simulation.invariants.no_write_before_admission_and_backup
-        || !simulation
-            .invariants
-            .no_next_phase_before_prior_receipt_succeeds
-        || !simulation.invariants.failure_routes_to_rollback
-        || !simulation
-            .invariants
-            .notification_only_after_successful_readback
-        || !simulation.invariants.notification_permanently_suppressed
-    {
+    let expected_invariants = SimulationInvariants {
+        no_write_before_admission_and_backup: no_write_before_admission_and_backup(
+            &simulation.receipts,
+        ),
+        no_next_phase_before_prior_receipt_succeeds: receipts_are_sequential(&simulation.receipts)
+            && receipts_follow_success(&simulation.receipts),
+        failure_routes_to_rollback: !saw_failure
+            || simulation
+                .receipts
+                .last()
+                .map(|receipt| receipt.phase.as_str())
+                == Some("rollback"),
+        notification_only_after_successful_readback: if saw_failure {
+            simulation
+                .receipts
+                .iter()
+                .find(|receipt| receipt.phase == "notification_handoff")
+                .is_none_or(|receipt| {
+                    receipt.status == "failed"
+                        && readback_precedes_notification(&simulation.receipts)
+                })
+        } else {
+            readback_precedes_notification(&simulation.receipts)
+        },
+        notification_permanently_suppressed: true,
+    };
+    if simulation.invariants != expected_invariants {
         return Err(ProgramError::invalid("simulation invariant failed"));
     }
     Ok(())
@@ -956,20 +1139,7 @@ fn validate_target(target: &Value, policy: &WriterPolicy) -> Result<TargetPin, P
             )));
         }
     }
-    if let Some(tenant_id) = object.get("tenantId").and_then(Value::as_str) {
-        if tenant_id != policy.tenant_id {
-            return Err(ProgramError::invalid(
-                "target tenant identity mismatches policy",
-            ));
-        }
-    }
-    if let Some(spreadsheet_id) = object.get("spreadsheetId").and_then(Value::as_str) {
-        if spreadsheet_id != policy.spreadsheet_id {
-            return Err(ProgramError::invalid(
-                "target spreadsheet identity mismatches policy",
-            ));
-        }
-    }
+    validate_target_identity_fields(target, policy)?;
     let snapshot = match object.get("snapshot") {
         Some(Value::Object(snapshot)) => Some(snapshot),
         Some(_) => {
@@ -1020,8 +1190,32 @@ fn validate_bundle(
     target: &TargetPin,
     target_value: &Value,
 ) -> Result<(), ProgramError> {
-    if bundle.bundle_version != BUNDLE_VERSION {
-        return Err(ProgramError::invalid("unsupported T3b bundle version"));
+    if bundle.plan_version != "security_intelligence_monitor_cutover_v1"
+        || bundle.bundle_version != BUNDLE_VERSION
+        || bundle.contract_version != "security_intelligence_monitor_v1"
+        || bundle.target_schema_version != SCHEMA_VERSION
+        || bundle.observed_target_schema_version != SCHEMA_VERSION
+        || bundle.coverage_status != "complete"
+    {
+        return Err(ProgramError::invalid(
+            "unsupported T3b plan or contract version",
+        ));
+    }
+    if bundle.gate.schema_compatible
+        != (bundle.preconditions.schema.compatible && bundle.preconditions.schema.satisfied)
+        || bundle.gate.coverage_complete != bundle.preconditions.coverage.coverage_complete
+        || bundle.gate.required_coverage_complete
+            != bundle.preconditions.coverage.required_coverage_complete
+        || bundle.gate.fail_closed != bundle.preconditions.coverage.fail_closed
+        || !bundle.gate.schema_compatible
+        || !bundle.gate.coverage_complete
+        || !bundle.gate.required_coverage_complete
+        || bundle.gate.fail_closed
+        || !bundle.gate.authorization_required
+        || !bundle.gate.blocked_reasons.is_empty()
+        || !bundle.blocked_reasons.is_empty()
+    {
+        return Err(ProgramError::invalid("bundle plan gate is not satisfied"));
     }
     if bundle.mode != "dry-run" || bundle.status != "eligible_pending_authorization" {
         return Err(ProgramError::invalid(
@@ -1056,6 +1250,10 @@ fn validate_bundle(
         || bundle.preconditions.schema.observed != SCHEMA_VERSION
         || !bundle.preconditions.schema.compatible
         || !bundle.preconditions.schema.satisfied
+        || !bundle.preconditions.ids.input_unique
+        || !bundle.preconditions.ids.target_unique
+        || !bundle.preconditions.ids.satisfied
+        || !bundle.preconditions.capacity.satisfied
         || !bundle.preconditions.authorization_required
         || bundle.preconditions.external_writes_allowed
     {
@@ -1063,6 +1261,8 @@ fn validate_bundle(
             "bundle preflight gate is not satisfied",
         ));
     }
+    validate_id_precondition(&bundle.preconditions.ids)?;
+    validate_capacity_precondition(&bundle.preconditions.capacity)?;
     let snapshot = bundle
         .preconditions
         .snapshot
@@ -1102,6 +1302,8 @@ fn validate_bundle(
             .invariants
             .iter()
             .any(|item| item == "human_fields_are_preserved")
+        || !has_exact_human_fields(&bundle.migration.preserved_existing_fields)
+        || !has_exact_schema_additions(&bundle.migration.additions)
     {
         return Err(ProgramError::invalid(
             "bundle additive migration contract is incomplete",
@@ -1132,12 +1334,136 @@ fn validate_bundle(
     }
     validate_notification(&bundle.notification)?;
     validate_notification(&bundle.notifier)?;
+    if bundle.notification != bundle.notifier {
+        return Err(ProgramError::invalid(
+            "bundle notification manifests diverge",
+        ));
+    }
+    if bundle.email.action != "suppress"
+        || bundle.email.candidate_action != "emit"
+        || !bundle.email.candidate_eligible
+        || bundle.email.eligible
+        || bundle.email.reason.is_empty()
+        || !bundle.email.payload.is_object()
+    {
+        return Err(ProgramError::invalid(
+            "bundle email operation is not suppressed",
+        ));
+    }
     if bundle.readback.on_failure != "block_notification_and_restore_from_backup"
         || !bundle.notification.requires_readback_success
     {
         return Err(ProgramError::invalid("bundle readback gate is incomplete"));
     }
     validate_target_identity_fields(target_value, policy)?;
+    Ok(())
+}
+
+fn validate_id_precondition(precondition: &BundleIdPrecondition) -> Result<(), ProgramError> {
+    let expected_key_fields = BTreeMap::from([
+        ("Findings".to_string(), "eventId".to_string()),
+        ("Investigations".to_string(), "investigationId".to_string()),
+        (
+            "Recommendations".to_string(),
+            "recommendationId".to_string(),
+        ),
+    ]);
+    if precondition.exact_key_fields != expected_key_fields
+        || !has_monitor_collection_keys(&precondition.input_counts)
+        || !has_monitor_collection_keys(&precondition.target_counts)
+    {
+        return Err(ProgramError::invalid(
+            "bundle ID precondition is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capacity_precondition(
+    precondition: &BundleCapacityPrecondition,
+) -> Result<(), ProgramError> {
+    for map in [
+        &precondition.limits,
+        &precondition.requested_rows,
+        &precondition.target_rows,
+        &precondition.requested_cells,
+    ] {
+        if !has_monitor_collection_keys(map) {
+            return Err(ProgramError::invalid(
+                "bundle capacity precondition is incomplete",
+            ));
+        }
+    }
+    for collection in ["findings", "investigations", "recommendations"] {
+        let limit = precondition.limits[collection];
+        if limit == 0
+            || limit > 10_000
+            || limit < precondition.requested_rows[collection]
+            || limit < precondition.target_rows[collection]
+            || precondition.requested_cells[collection] > 300_000
+        {
+            return Err(ProgramError::invalid(
+                "bundle capacity precondition exceeds policy",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn has_monitor_collection_keys<T>(map: &BTreeMap<String, T>) -> bool {
+    map.len() == 3
+        && ["findings", "investigations", "recommendations"]
+            .iter()
+            .all(|collection| map.contains_key(*collection))
+}
+
+fn has_exact_schema_additions(additions: &[BundleAddition]) -> bool {
+    if additions.len() != EXPECTED_SCHEMA_ADDITIONS.len() {
+        return false;
+    }
+    let actual = additions
+        .iter()
+        .map(|addition| (addition.tab.as_str(), addition.field.as_str()))
+        .collect::<BTreeSet<_>>();
+    actual.len() == additions.len()
+        && EXPECTED_SCHEMA_ADDITIONS
+            .iter()
+            .all(|addition| actual.contains(addition))
+}
+
+fn validate_plan_projection(bundle: &BundleInput) -> Result<(), ProgramError> {
+    if bundle.sheets.tabs.len() != 3 {
+        return Err(ProgramError::invalid(
+            "bundle plan projection is missing a sheet tab",
+        ));
+    }
+    let projected = bundle
+        .sheets
+        .tabs
+        .iter()
+        .map(|tab| {
+            tab.operations
+                .iter()
+                .map(|operation| BundlePlanOperation {
+                    action: operation.action.clone(),
+                    key: operation.key.clone(),
+                    eligible: operation.eligible,
+                    reason: operation.reason.clone(),
+                    record: operation.record.clone(),
+                    patch: operation.patch.clone(),
+                    preserved_human_fields: operation.preserved_human_fields.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if bundle.findings != projected[0]
+        || bundle.investigations != projected[1]
+        || bundle.recommendations != projected[2]
+    {
+        return Err(ProgramError::invalid(
+            "bundle plan operations diverge from sheet manifests",
+        ));
+    }
     Ok(())
 }
 
@@ -1244,6 +1570,25 @@ fn validate_operations(
                     "operation lookup does not pin exact key",
                 ));
             }
+            if operation.eligible != (operation.action != "suppress") {
+                return Err(ProgramError::invalid(
+                    "operation eligibility does not match its action",
+                ));
+            }
+            match operation.record.get(expected_key_field) {
+                Some(value) if value.as_str() == Some(operation.key.as_str()) => {}
+                Some(_) => {
+                    return Err(ProgramError::invalid(
+                        "operation record key does not match lookup key",
+                    ))
+                }
+                None if operation.action != "suppress" => {
+                    return Err(ProgramError::invalid(
+                        "operation record is missing its exact key",
+                    ))
+                }
+                None => {}
+            }
             validate_safe_map(&operation.record)?;
             validate_safe_map(&operation.patch)?;
             validate_safe_map(&operation.preserved_human_fields)?;
@@ -1287,7 +1632,7 @@ fn validate_operations(
             || assertion.key != operation.key
             || assertion.action != operation.action
             || assertion.expected_machine_record != operation.record
-            || !contains_all_strings(&assertion.preserved_human_fields, HUMAN_FIELDS)
+            || !has_exact_human_fields(&assertion.preserved_human_fields)
         {
             return Err(ProgramError::invalid(
                 "readback assertion does not match operation",
@@ -1372,6 +1717,7 @@ fn build_phases(
                 preserved_human_fields: operation.preserved_human_fields.clone(),
                 expected_target_fingerprint: target_fingerprint.clone(),
                 expected_revision: target.revision.clone(),
+                expected_etag: target.etag.clone(),
                 external_write_performed: false,
             })
             .collect();
@@ -1385,6 +1731,7 @@ fn build_phases(
                 key_field: tab.key_field.clone(),
                 expected_target_fingerprint: target_fingerprint.clone(),
                 expected_revision: target.revision.clone(),
+                expected_etag: target.etag.clone(),
                 external_writes_allowed: false,
                 operations,
             },
@@ -1411,6 +1758,7 @@ fn build_phases(
         request: PhaseRequest::ExactReadback {
             expected_target_fingerprint: target_fingerprint.clone(),
             expected_revision: target.revision.clone(),
+            expected_etag: target.etag.clone(),
             assertions,
             notification_requires_success: true,
         },
@@ -1547,6 +1895,7 @@ fn validate_program(program: &ExecutionProgram) -> Result<(), ProgramError> {
             &program.policy_fingerprint,
         )?;
     }
+    validate_program_readback_alignment(program)?;
     let actual = program
         .program_fingerprint
         .as_deref()
@@ -1556,6 +1905,58 @@ fn validate_program(program: &ExecutionProgram) -> Result<(), ProgramError> {
         return Err(ProgramError::invalid(
             "execution program fingerprint mismatch",
         ));
+    }
+    Ok(())
+}
+
+fn validate_program_readback_alignment(program: &ExecutionProgram) -> Result<(), ProgramError> {
+    let mut expected = Vec::new();
+    for phase in &program.phases[3..6] {
+        let PhaseRequest::SheetWrites {
+            tab,
+            range,
+            key_field,
+            operations,
+            ..
+        } = &phase.request
+        else {
+            return Err(ProgramError::invalid(
+                "write phase is missing its sheet request",
+            ));
+        };
+        expected.extend(operations.iter().map(|operation| ReadbackRequest {
+            tab: tab.clone(),
+            range: range.clone(),
+            key_field: key_field.clone(),
+            key: operation.key.clone(),
+            action: operation.action.clone(),
+            expected_machine_record: operation.record.clone(),
+            preserved_human_fields: Vec::new(),
+        }));
+    }
+    let PhaseRequest::ExactReadback { assertions, .. } = &program.phases[6].request else {
+        return Err(ProgramError::invalid(
+            "exact readback phase is missing its assertions",
+        ));
+    };
+    if assertions.len() != expected.len() {
+        return Err(ProgramError::invalid(
+            "exact readback assertions do not match write manifests",
+        ));
+    }
+    for (assertion, expected) in assertions.iter().zip(expected) {
+        if assertion.tab != expected.tab
+            || assertion.range != expected.range
+            || assertion.key_field != expected.key_field
+            || assertion.key != expected.key
+            || assertion.action != expected.action
+            || assertion.expected_machine_record != expected.expected_machine_record
+            || !has_exact_human_fields(&assertion.preserved_human_fields)
+        {
+            return Err(ProgramError::invalid(
+                "exact readback assertions do not match write manifests",
+            ));
+        }
     }
     Ok(())
 }
@@ -1599,6 +2000,7 @@ fn validate_program_request(
             PhaseRequest::BackupSnapshotPinning {
                 snapshot_fingerprint,
                 expected_revision,
+                expected_etag,
                 backup_required_before_writes,
                 external_writes_allowed,
                 ..
@@ -1606,6 +2008,7 @@ fn validate_program_request(
         ) => {
             if snapshot_fingerprint != &target.state_fingerprint
                 || expected_revision != &target.revision
+                || expected_etag != &target.etag
                 || !backup_required_before_writes
                 || *external_writes_allowed
             {
@@ -1617,6 +2020,7 @@ fn validate_program_request(
             PhaseRequest::AdditiveSchemaMigration {
                 from_version,
                 to_version,
+                additions,
                 preserved_existing_fields,
                 forbidden_operations,
                 external_writes_allowed,
@@ -1625,7 +2029,8 @@ fn validate_program_request(
         ) => {
             if *from_version != 6
                 || *to_version != SCHEMA_VERSION
-                || preserved_existing_fields.is_empty()
+                || !has_exact_human_fields(preserved_existing_fields)
+                || !has_exact_schema_additions(additions)
                 || !contains_all_strings(
                     forbidden_operations,
                     &[
@@ -1651,6 +2056,7 @@ fn validate_program_request(
                 key_field,
                 expected_target_fingerprint,
                 expected_revision,
+                expected_etag,
                 external_writes_allowed,
                 operations,
             },
@@ -1679,6 +2085,7 @@ fn validate_program_request(
                 )
                 || expected_target_fingerprint != &target.state_fingerprint
                 || expected_revision != &target.revision
+                || expected_etag != &target.etag
                 || *external_writes_allowed
             {
                 return Err(ProgramError::invalid("sheet write request is not pinned"));
@@ -1692,14 +2099,36 @@ fn validate_program_request(
                 previous_order = Some(order);
                 validate_key(&operation.key, prefix)?;
                 if operation.external_write_performed
+                    || operation.range != *range
+                    || operation.key_field != *key_field
+                    || operation.eligible != (operation.action != "suppress")
                     || operation.expected_target_fingerprint != target.state_fingerprint
                     || operation.expected_revision != target.revision
+                    || operation.expected_etag != target.etag
                     || operation
                         .patch
                         .keys()
                         .any(|field| HUMAN_FIELDS.contains(&field.as_str()))
+                    || operation
+                        .preserved_human_fields
+                        .keys()
+                        .any(|field| !HUMAN_FIELDS.contains(&field.as_str()))
                 {
                     return Err(ProgramError::invalid("program write request is unsafe"));
+                }
+                match operation.record.get(key_field) {
+                    Some(value) if value.as_str() == Some(operation.key.as_str()) => {}
+                    Some(_) => {
+                        return Err(ProgramError::invalid(
+                            "program write record key does not match lookup key",
+                        ))
+                    }
+                    None if operation.action != "suppress" => {
+                        return Err(ProgramError::invalid(
+                            "program write record is missing its exact key",
+                        ))
+                    }
+                    None => {}
                 }
                 validate_safe_map(&operation.record)?;
                 validate_safe_map(&operation.patch)?;
@@ -1711,16 +2140,18 @@ fn validate_program_request(
             PhaseRequest::ExactReadback {
                 expected_target_fingerprint,
                 expected_revision,
+                expected_etag,
                 assertions,
                 notification_requires_success,
             },
         ) => {
             if expected_target_fingerprint != &target.state_fingerprint
                 || expected_revision != &target.revision
+                || expected_etag != &target.etag
                 || !notification_requires_success
-                || assertions.iter().any(|assertion| {
-                    !contains_all_strings(&assertion.preserved_human_fields, HUMAN_FIELDS)
-                })
+                || assertions
+                    .iter()
+                    .any(|assertion| !has_exact_human_fields(&assertion.preserved_human_fields))
             {
                 return Err(ProgramError::invalid("readback request is not exact"));
             }
@@ -1946,19 +2377,23 @@ fn validate_target_identity_fields(
     target: &Value,
     policy: &WriterPolicy,
 ) -> Result<(), ProgramError> {
-    if let Some(tenant_id) = target.get("tenantId") {
-        if tenant_id.as_str() != Some(policy.tenant_id.as_str()) {
-            return Err(ProgramError::invalid(
-                "target tenant identity mismatches policy",
-            ));
-        }
+    let tenant_id = target
+        .get("tenantId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProgramError::invalid("target tenant identity is missing"))?;
+    if tenant_id != policy.tenant_id {
+        return Err(ProgramError::invalid(
+            "target tenant identity mismatches policy",
+        ));
     }
-    if let Some(spreadsheet_id) = target.get("spreadsheetId") {
-        if spreadsheet_id.as_str() != Some(policy.spreadsheet_id.as_str()) {
-            return Err(ProgramError::invalid(
-                "target spreadsheet identity mismatches policy",
-            ));
-        }
+    let spreadsheet_id = target
+        .get("spreadsheetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProgramError::invalid("target spreadsheet identity is missing"))?;
+    if spreadsheet_id != policy.spreadsheet_id {
+        return Err(ProgramError::invalid(
+            "target spreadsheet identity mismatches policy",
+        ));
     }
     Ok(())
 }
@@ -1969,6 +2404,7 @@ fn optional_target_text(
     fields: &[&str],
     label: &str,
 ) -> Result<Option<String>, ProgramError> {
+    let mut found = None;
     for source in [snapshot, Some(target)] {
         let Some(source) = source else {
             continue;
@@ -1981,10 +2417,13 @@ fn optional_target_text(
                 .as_str()
                 .ok_or_else(|| ProgramError::invalid(format!("{label} must be text")))?;
             validate_safe_token(text, label, 512)?;
-            return Ok(Some(text.to_string()));
+            if found.as_deref().is_some_and(|existing| existing != text) {
+                return Err(ProgramError::invalid(format!("conflicting {label} guards")));
+            }
+            found = Some(text.to_string());
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn validate_tenant_id(value: &str) -> Result<(), ProgramError> {
@@ -2060,7 +2499,10 @@ fn validate_safe_token(value: &str, field: &str, max_length: usize) -> Result<()
 }
 
 fn validate_key(value: &str, prefix: &str) -> Result<(), ProgramError> {
-    if !value.starts_with(prefix)
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return Err(ProgramError::invalid("invalid exact operation key"));
+    };
+    if Uuid::parse_str(suffix).is_err()
         || value.len() > 256
         || value
             .chars()
@@ -2115,6 +2557,12 @@ fn contains_all_strings(values: &[String], required: &[&str]) -> bool {
     required
         .iter()
         .all(|item| values.iter().any(|value| value == item))
+}
+
+fn has_exact_human_fields(values: &[String]) -> bool {
+    values.len() == HUMAN_FIELDS.len()
+        && values.iter().collect::<BTreeSet<_>>().len() == HUMAN_FIELDS.len()
+        && contains_all_strings(values, HUMAN_FIELDS)
 }
 
 fn validate_fingerprint(field: &str, value: &str) -> Result<(), ProgramError> {
@@ -2198,6 +2646,21 @@ fn canonicalize_json(value: &Value, sort_arrays: bool) -> Value {
 mod tests {
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
+
+    fn rechain_receipts(simulation: &mut Value) {
+        let mut previous = None;
+        for receipt_value in simulation["receipts"].as_array_mut().expect("receipts") {
+            receipt_value["previousReceiptFingerprint"] = previous
+                .as_ref()
+                .map(|fingerprint: &String| json!(fingerprint))
+                .unwrap_or(Value::Null);
+            let receipt: super::PhaseReceipt =
+                serde_json::from_value(receipt_value.clone()).expect("receipt shape");
+            let fingerprint = super::receipt_fingerprint(&receipt).expect("receipt fingerprint");
+            receipt_value["receiptFingerprint"] = json!(fingerprint.clone());
+            previous = Some(fingerprint);
+        }
+    }
 
     fn target_state_fingerprint_for_test(target: &Value) -> String {
         let state = json!({
@@ -2304,11 +2767,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         json!({
+            "planVersion": "security_intelligence_monitor_cutover_v1",
             "bundleVersion": "security_intelligence_monitor_cutover_bundle_v1",
             "mode": "dry-run",
+            "contractVersion": "security_intelligence_monitor_v1",
+            "targetSchemaVersion": 7,
+            "observedTargetSchemaVersion": 7,
             "status": "eligible_pending_authorization",
+            "coverageStatus": "complete",
             "externalWritesAllowed": false,
             "emailAllowed": false,
+            "gate": {
+                "schemaCompatible": true,
+                "coverageComplete": true,
+                "requiredCoverageComplete": true,
+                "failClosed": false,
+                "authorizationRequired": true,
+                "blockedReasons": []
+            },
+            "blockedReasons": [],
+            "findings": [findings.clone()],
+            "investigations": [investigations.clone()],
+            "recommendations": [recommendations.clone()],
             "fingerprints": {
                 "algorithm": "sha256-canonical-json-v1",
                 "input": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
@@ -2318,8 +2798,8 @@ mod tests {
                 "mode": {"expected": "read-only", "observed": "read-only", "satisfied": true},
                 "coverage": {"coverageComplete": true, "requiredCoverageComplete": true, "failClosed": false, "sources": [], "satisfied": true},
                 "schema": {"expected": 7, "observed": 7, "compatible": true, "satisfied": true},
-                "ids": {"inputUnique": true, "targetUnique": true, "exactKeyFields": {}, "inputCounts": {}, "targetCounts": {}, "satisfied": true},
-                "capacity": {"limits": {}, "requestedRows": {}, "targetRows": {}, "requestedCells": {}, "satisfied": true},
+                "ids": {"inputUnique": true, "targetUnique": true, "exactKeyFields": {"Findings": "eventId", "Investigations": "investigationId", "Recommendations": "recommendationId"}, "inputCounts": {"findings": 1, "investigations": 1, "recommendations": 1}, "targetCounts": {"findings": 0, "investigations": 0, "recommendations": 0}, "satisfied": true},
+                "capacity": {"limits": {"findings": 10000, "investigations": 10000, "recommendations": 10000}, "requestedRows": {"findings": 1, "investigations": 1, "recommendations": 1}, "targetRows": {"findings": 0, "investigations": 0, "recommendations": 0}, "requestedCells": {"findings": 28, "investigations": 15, "recommendations": 13}, "satisfied": true},
                 "snapshot": {"revision": "revision-7", "etag": "etag-7", "observedStateFingerprint": target_fingerprint, "satisfied": true},
                 "authorizationRequired": true,
                 "externalWritesAllowed": false
@@ -2330,8 +2810,23 @@ mod tests {
                 "status": "target_already_schema_7",
                 "mode": "additive_only",
                 "externalWritesAllowed": false,
-                "additions": [{"tab": "Findings", "field": "sourceKind", "reason": "typed source"}],
-                "preservedExistingFields": ["status", "notes", "links"],
+                "additions": [
+                    {"tab": "Findings", "field": "sourceKind", "reason": "typed source"},
+                    {"tab": "Findings", "field": "eventTime", "reason": "event instant"},
+                    {"tab": "Findings", "field": "rawSeverity", "reason": "raw severity"},
+                    {"tab": "Findings", "field": "contextualVerdict", "reason": "contextual verdict"},
+                    {"tab": "Findings", "field": "assertionsFact", "reason": "fact assertions"},
+                    {"tab": "Findings", "field": "assertionsInference", "reason": "inference assertions"},
+                    {"tab": "Findings", "field": "assertionsMissingData", "reason": "missing data assertions"},
+                    {"tab": "Findings", "field": "contractVersion", "reason": "contract version"},
+                    {"tab": "Investigations", "field": "coverageStatus", "reason": "coverage status"},
+                    {"tab": "Investigations", "field": "failClosed", "reason": "fail closed"},
+                    {"tab": "Investigations", "field": "contractVersion", "reason": "contract version"},
+                    {"tab": "Recommendations", "field": "sourceKind", "reason": "source kind"},
+                    {"tab": "Recommendations", "field": "links", "reason": "review links"},
+                    {"tab": "Recommendations", "field": "contractVersion", "reason": "contract version"}
+                ],
+                "preservedExistingFields": ["assignee", "comment", "comments", "decision", "decisionAt", "disposition", "email", "emailDisposition", "emailSentAt", "emailStatus", "humanDisposition", "humanStatus", "links", "notes", "notificationStatus", "owner", "resolution", "reviewedBy", "reviewedAt", "reviewer", "status"],
                 "invariants": ["append_only_columns", "existing_cells_are_not_reinterpreted", "existing_rows_are_not_deleted", "human_fields_are_preserved"],
                 "forbiddenOperations": ["delete_columns", "delete_cells", "delete_rows", "reinterpret_existing_columns", "overwrite_human_fields"]
             },
@@ -2349,6 +2844,7 @@ mod tests {
             "readback": {"phase": "required_after_sheet_mutations", "executed": false, "success": false, "assertions": assertions, "onFailure": "block_notification_and_restore_from_backup"},
             "rollback": {"strategy": "retain_target_snapshot_and_discard_local_bundle", "externalWritesPerformed": false, "targetFingerprint": target_fingerprint, "targetRevision": "revision-7", "steps": ["retain_original_target_snapshot", "future_authorized_writer_must_restore_backup_before_retry"]},
             "noEffect": {"sheetsWritesPerformed": false, "emailSent": false, "credentialsChanged": false, "targetMutated": false, "localBundleOnly": true, "rollbackAction": "discard_bundle_and_retain_target_snapshot"},
+            "email": {"action": "suppress", "candidateAction": "emit", "candidateEligible": true, "eligible": false, "reason": "notification_requires_successful_readback_and_human_authorization", "payload": {}},
             "notification": {"phase": "after_readback", "action": "suppress", "effective": "suppress", "candidateAction": "emit", "eligible": false, "recipientPolicy": "unresolved", "recipients": [], "requiresReadbackSuccess": true, "authorizationRequired": true, "reason": "notification_requires_readback_success_and_human_authorization", "payload": {}},
             "notifier": {"phase": "after_readback", "action": "suppress", "effective": "suppress", "candidateAction": "emit", "eligible": false, "recipientPolicy": "unresolved", "recipients": [], "requiresReadbackSuccess": true, "authorizationRequired": true, "reason": "notification_requires_readback_success_and_human_authorization", "payload": {}}
         })
@@ -2463,6 +2959,47 @@ mod tests {
             .remove("snapshot");
         super::compile_execution_program(&bundle(), &top_level_guards, &policy())
             .expect("T3b top-level snapshot guards should remain compatible");
+
+        let mut conflicting_guards = target();
+        conflicting_guards["revision"] = json!("conflicting-revision");
+        let error = super::compile_execution_program(&bundle(), &conflicting_guards, &policy())
+            .expect_err("conflicting target snapshot guards must block admission")
+            .to_string();
+        assert!(error.contains("conflicting"));
+
+        let mut missing_identity = target();
+        missing_identity
+            .as_object_mut()
+            .expect("target object")
+            .remove("tenantId");
+        missing_identity
+            .as_object_mut()
+            .expect("target object")
+            .remove("spreadsheetId");
+        let error = super::compile_execution_program(&bundle(), &missing_identity, &policy())
+            .expect_err("target identity must be explicit")
+            .to_string();
+        assert!(error.contains("target tenant identity"));
+    }
+
+    #[test]
+    fn propagates_etag_pins_when_revision_is_absent() {
+        let mut target = target();
+        target["snapshot"]
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("revision");
+        let mut bundle = bundle();
+        bundle["preconditions"]["snapshot"]["revision"] = Value::Null;
+        bundle["rollback"]["targetRevision"] = Value::Null;
+
+        let program = super::compile_execution_program(&bundle, &target, &policy())
+            .expect("etag-only target should remain admissible");
+        for phase in &program["phases"].as_array().expect("phases")[3..6] {
+            assert_eq!(phase["request"]["expectedEtag"], "etag-7");
+            assert_eq!(phase["request"]["operations"][0]["expectedEtag"], "etag-7");
+        }
+        assert_eq!(program["phases"][6]["request"]["expectedEtag"], "etag-7");
     }
 
     #[test]
@@ -2507,6 +3044,31 @@ mod tests {
             .expect_err("human field patch must block admission")
             .to_string();
         assert!(error.contains("human field"));
+
+        let mut omitted_human_patch = bundle();
+        omitted_human_patch["sheets"]["tabs"][0]["operations"][0]["patch"]["humanDisposition"] =
+            json!("overwrite");
+        let error = super::compile_execution_program(&omitted_human_patch, &target(), &policy())
+            .expect_err("all T3b human fields must block admission")
+            .to_string();
+        assert!(error.contains("human field"));
+
+        let mut invalid_key = bundle();
+        invalid_key["sheets"]["tabs"][0]["operations"][0]["key"] = json!("simv1-event-not-a-uuid");
+        invalid_key["sheets"]["tabs"][0]["operations"][0]["lookup"]["key"] =
+            json!("simv1-event-not-a-uuid");
+        let error = super::compile_execution_program(&invalid_key, &target(), &policy())
+            .expect_err("non-UUID monitor keys must block admission")
+            .to_string();
+        assert!(error.contains("exact operation key"));
+
+        let mut mismatched_record = bundle();
+        mismatched_record["sheets"]["tabs"][0]["operations"][0]["record"]["eventId"] =
+            json!("simv1-event-00000000-0000-0000-0000-000000000002");
+        let error = super::compile_execution_program(&mismatched_record, &target(), &policy())
+            .expect_err("operation records must carry their exact lookup key")
+            .to_string();
+        assert!(error.contains("record key"));
 
         let mut partial_readback = bundle();
         partial_readback["readback"]["assertions"]
@@ -2555,6 +3117,44 @@ mod tests {
                 .expect_err("To/Bcc role overlap must block admission")
                 .to_string();
         assert!(error.contains("duplicate notification recipient across roles"));
+    }
+
+    #[test]
+    fn rejects_incomplete_t3b_projection_and_preconditions() {
+        let mut divergent_plan = bundle();
+        divergent_plan["findings"][0]["reason"] = json!("forged-plan-reason");
+        let error = super::compile_execution_program(&divergent_plan, &target(), &policy())
+            .expect_err("top-level plan operations must match sheet manifests")
+            .to_string();
+        assert!(error.contains("plan operations diverge"));
+
+        let mut failed_ids = bundle();
+        failed_ids["preconditions"]["ids"]["satisfied"] = json!(false);
+        let error = super::compile_execution_program(&failed_ids, &target(), &policy())
+            .expect_err("failed ID preconditions must block admission")
+            .to_string();
+        assert!(error.contains("preflight gate"));
+
+        let mut missing_schema_addition = bundle();
+        missing_schema_addition["migration"]["additions"]
+            .as_array_mut()
+            .expect("schema additions")
+            .pop();
+        let error =
+            super::compile_execution_program(&missing_schema_addition, &target(), &policy())
+                .expect_err("schema 7 additions must remain complete")
+                .to_string();
+        assert!(error.contains("additive migration"));
+
+        let mut missing_human_field = bundle();
+        missing_human_field["migration"]["preservedExistingFields"]
+            .as_array_mut()
+            .expect("human fields")
+            .retain(|field| field != "status");
+        let error = super::compile_execution_program(&missing_human_field, &target(), &policy())
+            .expect_err("the full human-field preservation set is required")
+            .to_string();
+        assert!(error.contains("additive migration"));
     }
 
     #[test]
@@ -2711,11 +3311,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_rehashed_receipts_with_invalid_state_or_transition_chains() {
+        let program = compiled_program();
+        let simulation = super::simulate_execution_program(&program, None)
+            .expect("success simulation should compile");
+
+        let mut forged_state = simulation.clone();
+        forged_state["receipts"][1]["stateBefore"] = json!("forged-state");
+        rechain_receipts(&mut forged_state);
+        let error = super::verify_execution_receipts(&program, &forged_state)
+            .expect_err("rehashed receipt with a broken state chain must be rejected")
+            .to_string();
+        assert!(error.contains("state transition"));
+
+        let mut forged_transition = simulation;
+        forged_transition["transitions"][0]["to"] = json!("forged-transition");
+        let error = super::verify_execution_receipts(&program, &forged_transition)
+            .expect_err("forged state transition must be rejected")
+            .to_string();
+        assert!(error.contains("transition"));
+
+        let mut forged_readback = program.clone();
+        forged_readback["phases"][6]["request"]["assertions"][0]["key"] =
+            json!("simv1-event-00000000-0000-0000-0000-000000000002");
+        let mut forged_program: super::ExecutionProgram =
+            serde_json::from_value(forged_readback).expect("program shape");
+        forged_program.program_fingerprint =
+            Some(super::program_fingerprint(&forged_program).expect("program fingerprint"));
+        let forged_program =
+            serde_json::to_value(forged_program).expect("forged program serialization");
+        let error = super::simulate_execution_program(&forged_program, None)
+            .expect_err("readback assertions must remain aligned with write manifests")
+            .to_string();
+        assert!(error.contains("readback assertions"));
+    }
+
+    #[test]
     fn compiles_empty_input_but_keeps_all_safety_gates() {
         let mut empty = bundle();
         for tab in empty["sheets"]["tabs"].as_array_mut().unwrap() {
             tab["operations"] = json!([]);
         }
+        empty["findings"] = json!([]);
+        empty["investigations"] = json!([]);
+        empty["recommendations"] = json!([]);
         empty["readback"]["assertions"] = json!([]);
         let program = super::compile_execution_program(&empty, &target(), &policy())
             .expect("empty observer input should compile as a no-op program");

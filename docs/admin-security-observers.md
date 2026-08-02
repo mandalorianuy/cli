@@ -407,6 +407,11 @@ a no-op. The policy is an input contract, not approval. All executable paths
 keep `externalWritesAllowed=false`, `liveApplyAvailable=false`, and
 `humanAuthorizationRequired=true`.
 
+The CLI routes both monitor helpers through a local synthetic command tree
+before Discovery resolution, so these offline paths do not fetch an external
+Discovery document. The T5 admission dossier records technical checks only; it
+does not confer live, provider-write, notification, or human authority.
+
 ## DLP discovery workflow
 
 Metadata alone cannot determine whether a document contains customer records,

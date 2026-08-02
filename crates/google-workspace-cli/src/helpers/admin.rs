@@ -27,6 +27,7 @@ use std::pin::Pin;
 mod ip_intelligence;
 mod microsoft_graph_auth;
 mod monitor_contract;
+mod monitor_correlation;
 mod monitor_cutover;
 mod monitor_program;
 mod security_posture;
@@ -49,6 +50,7 @@ const DIRECTORY_CHROMEOS_READONLY_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.directory.device.chromeos.readonly";
 const DIRECTORY_MOBILE_READONLY_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.directory.device.mobile.readonly";
+const MAX_CORRELATION_INPUT_BYTES: u64 = 1_048_576;
 
 struct ObserverRequest {
     application_name: &'static str,
@@ -1099,6 +1101,51 @@ fn build_security_monitor_plan_cmd() -> Command {
         )
 }
 
+fn build_security_monitor_correlate_cmd() -> Command {
+    Command::new("+security-monitor-correlate")
+        .about("[Helper] Correlate an existing security observer report without external effects")
+        .arg(
+            Arg::new("input")
+                .long("input")
+                .required(true)
+                .value_name("FILE")
+                .help("Local read-only security observer report JSON"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .required(true)
+                .action(ArgAction::SetTrue)
+                .help("Required: emit only a bounded local correlation view"),
+        )
+        .arg(
+            Arg::new("window-minutes")
+                .long("window-minutes")
+                .value_parser(value_parser!(u64).range(1..=1_440))
+                .default_value("30")
+                .value_name("MINUTES")
+                .help("Maximum event-time distance allowed for a correlation"),
+        )
+        .arg(
+            Arg::new("max-correlations")
+                .long("max-correlations")
+                .value_parser(value_parser!(u32).range(1..=100))
+                .default_value("50")
+                .value_name("COUNT")
+                .help("Maximum deterministic correlation records to emit"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads one bounded local JSON file only.\n  Never calls Google Admin, Microsoft Graph, Sheets, Gmail, a writer, or a notifier.\n  Missing, disabled, unavailable, contradictory, stale, or overflowing evidence remains fail-closed and requires human review.",
+        )
+}
+
 fn build_security_monitor_program_cmd() -> Command {
     Command::new("+security-monitor-program")
         .about("[Helper] Compile and simulate a local Security Intelligence Monitor execution program")
@@ -1617,6 +1664,38 @@ fn read_monitor_plan_json(path: &str, flag_name: &str) -> Result<Value, GwsError
     })
 }
 
+fn read_security_monitor_correlation_json(path: &str) -> Result<Value, GwsError> {
+    let safe_path = crate::validate::validate_safe_file_path(path, "--input")?;
+    let metadata = std::fs::metadata(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not inspect correlation input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    if metadata.len() > MAX_CORRELATION_INPUT_BYTES {
+        return Err(GwsError::Validation(format!(
+            "Correlation input exceeds the {MAX_CORRELATION_INPUT_BYTES}-byte safety bound"
+        )));
+    }
+    let contents = std::fs::read_to_string(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not read correlation input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    if contents.len() as u64 > MAX_CORRELATION_INPUT_BYTES {
+        return Err(GwsError::Validation(format!(
+            "Correlation input exceeds the {MAX_CORRELATION_INPUT_BYTES}-byte safety bound"
+        )));
+    }
+    serde_json::from_str(&contents).map_err(|error| {
+        GwsError::Validation(format!(
+            "Correlation input is not valid JSON: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })
+}
+
 fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
     if !matches.get_flag("dry-run") {
         return Err(GwsError::Validation(
@@ -1647,6 +1726,37 @@ fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
     let format = crate::formatter::OutputFormat::parse(output_format)
         .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
     println!("{}", crate::formatter::format_value(&value, &format));
+    Ok(())
+}
+
+fn handle_security_monitor_correlate(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("dry-run") {
+        return Err(GwsError::Validation(
+            "+security-monitor-correlate requires --dry-run; external correlation is not implemented"
+                .to_string(),
+        ));
+    }
+    let input_path = matches
+        .get_one::<String>("input")
+        .expect("input is required by clap");
+    let window_minutes = matches
+        .get_one::<u64>("window-minutes")
+        .copied()
+        .unwrap_or(30);
+    let max_correlations = matches
+        .get_one::<u32>("max-correlations")
+        .copied()
+        .unwrap_or(50) as usize;
+    let input = read_security_monitor_correlation_json(input_path)?;
+    let output = monitor_correlation::correlate_report(&input, window_minutes, max_correlations)
+        .map_err(|error| GwsError::Validation(format!("Security correlation rejected: {error}")))?;
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&output, &format));
     Ok(())
 }
 
@@ -1717,6 +1827,7 @@ impl Helper for AdminHelper {
         cmd = cmd.subcommand(build_admin_observer_cmd());
         cmd = cmd.subcommand(build_security_observer_cmd());
         cmd = cmd.subcommand(build_security_monitor_plan_cmd());
+        cmd = cmd.subcommand(build_security_monitor_correlate_cmd());
         cmd = cmd.subcommand(build_security_monitor_program_cmd());
         cmd
     }
@@ -1738,6 +1849,12 @@ impl Helper for AdminHelper {
             }
             if let Some(plan_matches) = matches.subcommand_matches("+security-monitor-plan") {
                 handle_security_monitor_plan(plan_matches)?;
+                return Ok(true);
+            }
+            if let Some(correlation_matches) =
+                matches.subcommand_matches("+security-monitor-correlate")
+            {
+                handle_security_monitor_correlate(correlation_matches)?;
                 return Ok(true);
             }
             if let Some(program_matches) = matches.subcommand_matches("+security-monitor-program") {
@@ -1803,7 +1920,55 @@ mod tests {
         assert!(names.contains(&"+admin-observer"));
         assert!(names.contains(&"+security-observer"));
         assert!(names.contains(&"+security-monitor-plan"));
+        assert!(names.contains(&"+security-monitor-correlate"));
         assert!(names.contains(&"+security-monitor-program"));
+    }
+
+    #[test]
+    fn security_monitor_correlation_command_is_local_and_bounded() {
+        let matches = build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--window-minutes",
+                "60",
+                "--max-correlations",
+                "25",
+            ])
+            .expect("bounded local correlation arguments should parse");
+
+        assert!(matches.get_flag("dry-run"));
+        assert_eq!(matches.get_one::<u64>("window-minutes"), Some(&60));
+        assert_eq!(matches.get_one::<u32>("max-correlations"), Some(&25));
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+            ])
+            .is_err());
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--window-minutes",
+                "0",
+            ])
+            .is_err());
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--max-correlations",
+                "101",
+            ])
+            .is_err());
     }
 
     #[test]

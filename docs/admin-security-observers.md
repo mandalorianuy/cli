@@ -345,6 +345,27 @@ happened; a recommendation records a proposed human decision. Recommended
 states are `proposed`, `accepted`, `rejected`, and `implemented`. The observer
 never changes a recommendation state and never applies a DLP or sharing rule.
 
+### Local context correlation (T7)
+
+`+security-monitor-correlate` reads one bounded observer JSON file and produces
+the separate `security_intelligence_monitor_correlation_v1` contract. It is
+local-only, requires `--dry-run`, and never calls Google Admin, Microsoft Graph,
+Sheets, Gmail, a writer, or a notifier.
+
+```bash
+gws admin-reports +security-monitor-correlate \
+  --input ./evidence/security-observer.json \
+  --dry-run \
+  --window-minutes 30 \
+  --max-correlations 50
+```
+
+Correlation requires exact normalized actor/email, resource, OAuth client,
+target, or rule keys and bounded event times. IDs and fingerprints are
+deterministic; evidence is allowlisted and human-review fields remain empty.
+Incomplete, stale, contradictory, ambiguous, unsafe, or overflowing inputs stay
+fail-closed. IP context is observation only and never proves identity or safety.
+
 ### Controlled cutover planner and bundle compiler (T3/T3b)
 
 `+security-monitor-plan` is a local, deterministic planner for a later

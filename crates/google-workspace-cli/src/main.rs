@@ -386,7 +386,7 @@ fn is_local_security_monitor_command(args: &[String], service_arg: &str, api_nam
         }
         return matches!(
             arg.as_str(),
-            "+security-monitor-plan" | "+security-monitor-program"
+            "+security-monitor-plan" | "+security-monitor-correlate" | "+security-monitor-program"
         );
     }
     false
@@ -620,6 +620,17 @@ mod tests {
         assert!(is_local_security_monitor_command(
             &program_args,
             "reports",
+            "admin"
+        ));
+
+        let correlation_args = vec![
+            "gws".to_string(),
+            "admin-reports".to_string(),
+            "+security-monitor-correlate".to_string(),
+        ];
+        assert!(is_local_security_monitor_command(
+            &correlation_args,
+            "admin-reports",
             "admin"
         ));
 

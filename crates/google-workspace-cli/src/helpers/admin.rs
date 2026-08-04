@@ -25,6 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod ip_intelligence;
+mod security_posture;
 
 pub struct AdminHelper;
 
@@ -1024,6 +1025,28 @@ fn build_security_observer_cmd() -> Command {
                 ),
         )
         .arg(
+            Arg::new("include-posture")
+                .long("include-posture")
+                .action(ArgAction::SetTrue)
+                .help("Include read-only Google identity and administrator posture"),
+        )
+        .arg(
+            Arg::new("microsoft-graph")
+                .long("microsoft-graph")
+                .requires("include-posture")
+                .action(ArgAction::SetTrue)
+                .help("Include Microsoft 365 posture and signals using MICROSOFT_GRAPH_ACCESS_TOKEN"),
+        )
+        .arg(
+            Arg::new("inactive-days")
+                .long("inactive-days")
+                .requires("include-posture")
+                .value_parser(value_parser!(u32).range(30..=730))
+                .default_value_if("include-posture", "true", "90")
+                .value_name("DAYS")
+                .help("Flag enabled Google accounts without a recent login after this many days"),
+        )
+        .arg(
             Arg::new("format")
                 .long("format")
                 .value_parser(["json", "table", "yaml", "csv"])
@@ -1031,7 +1054,7 @@ fn build_security_observer_cmd() -> Command {
                 .value_name("FORMAT"),
         )
         .after_help(
-            "READ-ONLY GUARANTEE:\n  Uses only Admin Reports API GET requests.\n  Never suspends users, revokes tokens, changes 2SV, or modifies devices.",
+            "READ-ONLY GUARANTEE:\n  Uses only Google Admin and optional Microsoft Graph GET requests.\n  Never suspends users, revokes tokens, changes 2SV, modifies devices, or changes policies.",
         )
 }
 
@@ -1339,6 +1362,27 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         .get_one::<String>("format")
         .map(String::as_str)
         .unwrap_or("json");
+    let include_posture = matches.get_flag("include-posture");
+    let include_microsoft = matches.get_flag("microsoft-graph");
+    let inactive_days = matches
+        .get_one::<u32>("inactive-days")
+        .copied()
+        .unwrap_or(90) as i64;
+    let microsoft_token = if include_microsoft {
+        Some(
+            std::env::var(security_posture::MICROSOFT_GRAPH_TOKEN_ENV)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    GwsError::Auth(format!(
+                        "Microsoft Graph was requested but {} is not set",
+                        security_posture::MICROSOFT_GRAPH_TOKEN_ENV
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let config = security_observer_config(matches);
 
     let end_time = Utc::now();
@@ -1346,7 +1390,15 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
     let start_rfc3339 = start_time.to_rfc3339_opts(SecondsFormat::Secs, true);
     let end_rfc3339 = end_time.to_rfc3339_opts(SecondsFormat::Secs, true);
     let requests = security_observer_requests(&start_rfc3339, max_results);
-    let scopes: Vec<&str> = requests.iter().map(|request| request.scope).collect();
+    let mut scopes: Vec<&str> = requests.iter().map(|request| request.scope).collect();
+    if include_posture {
+        scopes.extend([
+            security_posture::GOOGLE_USER_SCOPE,
+            security_posture::GOOGLE_ROLE_SCOPE,
+        ]);
+    }
+    scopes.sort_unstable();
+    scopes.dedup();
     let token = auth::get_token(&scopes)
         .await
         .map_err(|error| GwsError::Auth(format!("Authentication failed: {error:#}")))?;
@@ -1380,7 +1432,32 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         ip_intelligence::IpIntelligenceSummary::disabled()
     };
     let recommendations = build_recommendations(&findings, &telemetry);
-    let report = json!({
+    let security_posture = if include_posture {
+        let google_signal_contexts = findings
+            .iter()
+            .map(|finding| security_posture::GoogleSignalContext {
+                event_id: finding.event_id.clone(),
+                actor: finding.actor.clone(),
+                rule: finding.rule.to_string(),
+                event_time: finding.event_time.clone(),
+            })
+            .collect::<Vec<_>>();
+        Some(
+            security_posture::collect_security_posture(
+                &client,
+                &token,
+                microsoft_token.as_deref(),
+                &google_signal_contexts,
+                end_time,
+                inactive_days,
+                &start_rfc3339,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let mut report = json!({
         "mode": "read-only",
         "window": {
             "startTime": start_rfc3339,
@@ -1399,6 +1476,19 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         "recommendationCount": recommendations.len(),
         "recommendations": recommendations,
     });
+    if let Some(posture) = security_posture {
+        report
+            .as_object_mut()
+            .expect("security observer report is an object")
+            .insert(
+                "securityPosture".to_string(),
+                serde_json::to_value(posture).map_err(|error| {
+                    GwsError::Other(anyhow::anyhow!(
+                        "Could not serialize security posture report: {error}"
+                    ))
+                })?,
+            );
+    }
     let format = crate::formatter::OutputFormat::parse(output_format)
         .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
     println!("{}", crate::formatter::format_value(&report, &format));
@@ -1637,6 +1727,33 @@ mod tests {
             .is_err());
         assert!(build_security_observer_cmd()
             .try_get_matches_from(["+security-observer", "--min-severity", "urgent"])
+            .is_err());
+    }
+
+    #[test]
+    fn security_observer_accepts_opt_in_posture_and_microsoft_sources() {
+        let matches = build_security_observer_cmd()
+            .try_get_matches_from([
+                "+security-observer",
+                "--include-posture",
+                "--microsoft-graph",
+                "--inactive-days",
+                "120",
+            ])
+            .expect("posture flags should be accepted");
+
+        assert!(matches.get_flag("include-posture"));
+        assert!(matches.get_flag("microsoft-graph"));
+        assert_eq!(matches.get_one::<u32>("inactive-days"), Some(&120));
+    }
+
+    #[test]
+    fn security_observer_keeps_posture_flags_opt_in() {
+        assert!(build_security_observer_cmd()
+            .try_get_matches_from(["+security-observer", "--microsoft-graph"])
+            .is_err());
+        assert!(build_security_observer_cmd()
+            .try_get_matches_from(["+security-observer", "--inactive-days", "90"])
             .is_err());
     }
 

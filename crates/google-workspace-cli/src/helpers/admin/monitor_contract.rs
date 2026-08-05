@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub(super) const MONITOR_CONTRACT_VERSION: &str = "security_intelligence_monitor_v1";
+pub(super) const POSTURE_FINDING_SCHEMA: &str = "posture_finding_v1";
+pub(super) const POSTURE_CASE_SCHEMA: &str = "posture_case_v1";
+pub(super) const POSTURE_RECOMMENDATION_SCHEMA: &str = "posture_recommendation_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,8 +187,18 @@ struct MonitorEmailPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MonitorLifecycleSchemas {
+    finding: &'static str,
+    #[serde(rename = "case")]
+    case_schema: &'static str,
+    recommendation: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct SecurityIntelligenceMonitorV1 {
     contract_version: &'static str,
+    lifecycle_schemas: MonitorLifecycleSchemas,
     generated_at: String,
     status: &'static str,
     coverage_complete: bool,
@@ -235,6 +248,11 @@ pub(super) fn build_monitor_integration(report: &SecurityPostureReport) -> Monit
     MonitorIntegration {
         security_intelligence_monitor_v1: SecurityIntelligenceMonitorV1 {
             contract_version: MONITOR_CONTRACT_VERSION,
+            lifecycle_schemas: MonitorLifecycleSchemas {
+                finding: POSTURE_FINDING_SCHEMA,
+                case_schema: POSTURE_CASE_SCHEMA,
+                recommendation: POSTURE_RECOMMENDATION_SCHEMA,
+            },
             generated_at: bounded_text(&report.generated_at, 64),
             status: if fail_closed {
                 "incomplete"
@@ -1085,6 +1103,14 @@ mod tests {
         assert_eq!(
             json!("security_intelligence_monitor_v1"),
             value["security_intelligence_monitor_v1"]["contractVersion"]
+        );
+        assert_eq!(
+            json!({
+                "finding": "posture_finding_v1",
+                "case": "posture_case_v1",
+                "recommendation": "posture_recommendation_v1"
+            }),
+            value["security_intelligence_monitor_v1"]["lifecycleSchemas"]
         );
     }
 }

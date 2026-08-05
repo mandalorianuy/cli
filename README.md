@@ -320,6 +320,8 @@ gws drive --help      # shows +upload …
 | `drive` | `+upload` | Upload a file with automatic metadata |
 | `calendar` | `+insert` | Create a new event |
 | `calendar` | `+agenda` | Show upcoming events (uses Google account timezone; override with `--timezone`) |
+| `admin-reports` | `+admin-observer` | Read-only domain inventory for users, groups, OUs, roles, and domains |
+| `admin-reports` | `+security-observer` | Detect identity, Drive sharing, bulk access, and DLP signals, with optional IP intelligence |
 | `script` | `+push` | Replace all files in an Apps Script project with local files |
 | `workflow` | `+standup-report` | Today's meetings + open tasks as a standup summary |
 | `workflow` | `+meeting-prep` | Prepare for your next meeting: agenda, attendees, and linked docs |
@@ -355,6 +357,15 @@ gws workflow +standup-report
 
 # Show today's agenda in a specific timezone
 gws calendar +agenda --today --timezone America/New_York
+
+# Read-only Workspace administration inventory
+gws admin-reports +admin-observer
+
+# Detect high and critical identity, Drive, and DLP events
+gws admin-reports +security-observer \
+  --internal-domain example.com \
+  --trusted-domain approved-partner.example \
+  --ip-intelligence
 ```
 
 ### Model Armor (Response Sanitization)
@@ -386,6 +397,7 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_SANITIZE_MODE` | `warn` (default) or `block` |
 | `GOOGLE_WORKSPACE_CLI_LOG` | Log level for stderr (e.g., `gws=debug`). Off by default. |
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON log files with daily rotation. Off by default. |
+| `GOOGLE_WORKSPACE_CLI_IPINFO_TOKEN` | Optional IPinfo token for ASN, geolocation, and available VPN/proxy/Tor signals in `+security-observer --ip-intelligence` |
 | `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands |
 
 Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).

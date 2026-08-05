@@ -930,6 +930,7 @@ dependencies = [
  "google-workspace",
  "hostname",
  "iana-time-zone",
+ "ipnet",
  "keyring",
  "mail-builder",
  "mime_guess2",

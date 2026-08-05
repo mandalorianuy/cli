@@ -16,6 +16,7 @@ use crate::error::GwsError;
 use clap::{ArgMatches, Command};
 use std::future::Future;
 use std::pin::Pin;
+pub mod admin;
 pub mod calendar;
 pub mod chat;
 pub mod docs;
@@ -113,6 +114,7 @@ pub trait Helper: Send + Sync {
 
 pub fn get_helper(service: &str) -> Option<Box<dyn Helper>> {
     match service {
+        "admin" => Some(Box::new(admin::AdminHelper)),
         "gmail" => Some(Box::new(gmail::GmailHelper)),
         "sheets" => Some(Box::new(sheets::SheetsHelper)),
         "docs" => Some(Box::new(docs::DocsHelper)),
@@ -124,5 +126,15 @@ pub fn get_helper(service: &str) -> Option<Box<dyn Helper>> {
         "modelarmor" => Some(Box::new(modelarmor::ModelArmorHelper)),
         "workflow" => Some(Box::new(workflows::WorkflowHelper)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_service_exposes_observer_helper() {
+        assert!(get_helper("admin").is_some());
     }
 }

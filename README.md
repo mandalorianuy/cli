@@ -407,6 +407,27 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `MICROSOFT_GRAPH_CERTIFICATE_KEY_ID` | Optional strict UUID for the registered Entra certificate `kid` header |
 | `MICROSOFT_GRAPH_CERTIFICATE_THUMBPRINT` | Optional 40-hex-character SHA-1 certificate thumbprint checked against the certificate file |
 
+For unattended runs, certificate settings may instead be stored in
+`$GOOGLE_WORKSPACE_CLI_CONFIG_DIR/microsoft_graph.json`. The file must be a
+regular, owned, non-symlink `0600` file and contain only absolute certificate
+and private-key path references:
+
+```json
+{
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "certificateFile": "/absolute/path/certificate.pem",
+  "privateKeyFile": "/absolute/path/private-key.pem",
+  "certificateKeyId": "00000000-0000-0000-0000-000000000000",
+  "certificateThumbprint": "OPTIONAL_40_HEX_SHA1"
+}
+```
+
+An explicit access token remains highest priority. If any certificate
+environment variable is present, the complete environment configuration is
+required and takes priority over the profile file; partial environment input
+fails closed.
+
 Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).
 
 ## Exit Codes

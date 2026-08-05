@@ -1037,7 +1037,7 @@ fn build_security_observer_cmd() -> Command {
                 .requires("include-posture")
                 .action(ArgAction::SetTrue)
                 .help(
-                    "Include Microsoft 365 posture and signals using MICROSOFT_GRAPH_ACCESS_TOKEN, or certificate auth from MICROSOFT_GRAPH_TENANT_ID, MICROSOFT_GRAPH_CLIENT_ID, MICROSOFT_GRAPH_CERTIFICATE_FILE, and MICROSOFT_GRAPH_PRIVATE_KEY_FILE; optionally set MICROSOFT_GRAPH_CERTIFICATE_KEY_ID",
+                    "Include Microsoft 365 posture and signals using MICROSOFT_GRAPH_ACCESS_TOKEN; certificate auth uses MICROSOFT_GRAPH_TENANT_ID, MICROSOFT_GRAPH_CLIENT_ID, MICROSOFT_GRAPH_CERTIFICATE_FILE, and MICROSOFT_GRAPH_PRIVATE_KEY_FILE, or a mode-0600 microsoft_graph.json file in GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
                 ),
         )
         .arg(

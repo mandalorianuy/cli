@@ -289,6 +289,23 @@ counter-evidence, uncertainty, recommended human action, urgency, and
 confidence. It never claims compromise, exfiltration, or successful
 remediation from a provider severity alone.
 
+When posture is enabled, the report also adds the sibling envelope
+`monitorIntegration.security_intelligence_monitor_v1`. This is the durable
+consumer contract for case-management and notification integrations; it does
+not replace `securityPosture` and is never emitted when posture is disabled.
+Its posture findings use deterministic `findingId` values (`simv1-finding-*`)
+instead of reusing Google or Microsoft audit `eventId` values. The identifier
+does not contain the subject, while the separately allowlisted `actor` remains
+available when the subject is a valid email address.
+
+The integration envelope keeps raw severity and contextual verdict separate,
+bounds `quickView` to 300 characters, allowlists evidence, uses only static
+provider-console links, and emits recommendations as independent proposed
+entities. Coverage is explicit per source: unavailable required sources set
+`failClosed=true`; disabled optional sources produce `status=degraded`, never a
+clean claim. The included email object is a deterministic payload template for
+downstream delivery; the observer itself does not send email or mutate cases.
+
 Initial stable controls include:
 
 - `GOOGLE.IDENTITY.ADMIN_WITHOUT_2SV` and

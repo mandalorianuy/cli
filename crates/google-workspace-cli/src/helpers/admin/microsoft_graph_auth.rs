@@ -21,7 +21,7 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -56,7 +56,9 @@ const ASSERTION_LIFETIME_SECONDS: i64 = 600;
 const TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 const MIN_ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 300;
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 1_048_576;
+const MAX_PROFILE_CONFIG_BYTES: u64 = 16_384;
 const MAX_TOKEN_RESPONSE_BYTES: u64 = 65_536;
+const MICROSOFT_GRAPH_PROFILE_CONFIG_FILE: &str = "microsoft_graph.json";
 
 const REQUIRED_GRAPH_ROLES: [&str; 7] = [
     "User.Read.All",
@@ -93,6 +95,17 @@ struct CertificateConfig {
     private_key_file: PathBuf,
     certificate_key_id: Option<String>,
     expected_thumbprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileCertificateConfig {
+    tenant_id: String,
+    client_id: String,
+    certificate_file: String,
+    private_key_file: String,
+    certificate_key_id: Option<String>,
+    certificate_thumbprint: Option<String>,
 }
 
 impl CertificateConfig {
@@ -138,6 +151,55 @@ impl CertificateConfig {
             client_id,
             certificate_file: checked_path(certificate_file)?,
             private_key_file: checked_path(private_key_file)?,
+            certificate_key_id,
+            expected_thumbprint,
+        })
+    }
+
+    fn from_env_or_profile() -> Result<Self, AuthError> {
+        match Self::from_env() {
+            Ok(config) => Ok(config),
+            Err(error) if error.code == "microsoft_graph_auth_not_configured" => {
+                Self::from_profile()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_profile() -> Result<Self, AuthError> {
+        let path = crate::auth_commands::config_dir().join(MICROSOFT_GRAPH_PROFILE_CONFIG_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AuthError::new("microsoft_graph_auth_not_configured"));
+            }
+            Err(_) => return Err(AuthError::new("microsoft_graph_config_file_invalid")),
+        }
+        let bytes = read_secure_file_with_limits(
+            &path,
+            true,
+            "microsoft_graph_config_file_invalid",
+            MAX_PROFILE_CONFIG_BYTES,
+        )?;
+        let profile = serde_json::from_slice::<ProfileCertificateConfig>(&bytes)
+            .map_err(|_| AuthError::new("microsoft_graph_config_file_invalid"))?;
+
+        let tenant_id = strict_uuid(&profile.tenant_id, "microsoft_graph_invalid_tenant_id")?;
+        let client_id = strict_uuid(&profile.client_id, "microsoft_graph_invalid_client_id")?;
+        let certificate_key_id = profile
+            .certificate_key_id
+            .map(|value| strict_uuid(&value, "microsoft_graph_invalid_certificate_key_id"))
+            .transpose()?;
+        let expected_thumbprint = profile
+            .certificate_thumbprint
+            .map(|value| normalize_thumbprint(&value))
+            .transpose()?;
+
+        Ok(Self {
+            tenant_id,
+            client_id,
+            certificate_file: checked_path(profile.certificate_file)?,
+            private_key_file: checked_path(profile.private_key_file)?,
             certificate_key_id,
             expected_thumbprint,
         })
@@ -227,7 +289,7 @@ impl MicrosoftGraphAuthSession {
             });
         }
 
-        let config = CertificateConfig::from_env().map_err(to_gws_error)?;
+        let config = CertificateConfig::from_env_or_profile().map_err(to_gws_error)?;
         Ok(Self::from_config(client, config))
     }
 
@@ -675,11 +737,20 @@ fn read_secure_file(path: &Path, private_key: bool) -> Result<Vec<u8>, AuthError
     } else {
         "microsoft_graph_certificate_file_invalid"
     };
+    read_secure_file_with_limits(path, private_key, invalid_code, MAX_CREDENTIAL_FILE_BYTES)
+}
+
+fn read_secure_file_with_limits(
+    path: &Path,
+    require_private_permissions: bool,
+    invalid_code: &'static str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AuthError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| AuthError::new(invalid_code))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(AuthError::new(invalid_code));
     }
-    validate_file_permissions(path, &metadata, private_key, invalid_code)?;
+    validate_file_permissions(path, &metadata, require_private_permissions, invalid_code)?;
 
     #[cfg(unix)]
     let file = OpenOptions::new()
@@ -704,10 +775,10 @@ fn read_secure_file(path: &Path, private_key: bool) -> Result<Vec<u8>, AuthError
     }
 
     let mut contents = Vec::new();
-    file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_end(&mut contents)
         .map_err(|_| AuthError::new(invalid_code))?;
-    if contents.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+    if contents.len() as u64 > max_bytes {
         return Err(AuthError::new(invalid_code));
     }
     Ok(contents)
@@ -911,6 +982,67 @@ mod tests {
 
         assert_eq!(token.as_str(), explicit_value);
         assert!(token.is_redacted_debug());
+        clear_auth_env();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn default_profile_config_supplies_certificate_auth_without_process_env() {
+        clear_auth_env();
+        let profile = tempfile::tempdir().expect("profile directory");
+        let files = test_certificate_files();
+        let config_path = profile.path().join("microsoft_graph.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "tenantId": TENANT_ID,
+                "clientId": CLIENT_ID,
+                "certificateFile": files.certificate_file,
+                "privateKeyFile": files.private_key_file,
+                "certificateKeyId": KEY_ID,
+            })
+            .to_string(),
+        )
+        .expect("profile config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+            .expect("profile config permissions");
+        env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", profile.path());
+
+        let session = MicrosoftGraphAuthSession::from_env(reqwest::Client::new())
+            .expect("profile certificate auth");
+        let AuthSource::Certificate { config, .. } = session.source else {
+            panic!("profile must resolve certificate auth");
+        };
+        assert_eq!(config.tenant_id, TENANT_ID);
+        assert_eq!(config.client_id, CLIENT_ID);
+        assert_eq!(config.certificate_file, files.certificate_file);
+        assert_eq!(config.private_key_file, files.private_key_file);
+        assert_eq!(config.certificate_key_id.as_deref(), Some(KEY_ID));
+
+        env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        clear_auth_env();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn profile_config_with_group_read_permission_fails_closed() {
+        clear_auth_env();
+        let profile = tempfile::tempdir().expect("profile directory");
+        let config_path = profile.path().join("microsoft_graph.json");
+        fs::write(&config_path, "{}").expect("profile config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640))
+            .expect("profile config permissions");
+        env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", profile.path());
+
+        let error = MicrosoftGraphAuthSession::from_env(reqwest::Client::new())
+            .expect_err("group-readable profile config must fail closed");
+        assert!(error
+            .to_string()
+            .contains("microsoft_graph_config_file_invalid"));
+
+        env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
         clear_auth_env();
     }
 

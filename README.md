@@ -399,6 +399,13 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON log files with daily rotation. Off by default. |
 | `GOOGLE_WORKSPACE_CLI_IPINFO_TOKEN` | Optional IPinfo token for ASN, geolocation, and available VPN/proxy/Tor signals in `+security-observer --ip-intelligence` |
 | `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands |
+| `MICROSOFT_GRAPH_ACCESS_TOKEN` | Explicit read-only Graph bearer-token override for `+security-observer --include-posture --microsoft-graph` (highest priority) |
+| `MICROSOFT_GRAPH_TENANT_ID` | Strict Microsoft Entra tenant UUID for certificate client credentials |
+| `MICROSOFT_GRAPH_CLIENT_ID` | Strict Microsoft Entra application/client UUID for certificate client credentials |
+| `MICROSOFT_GRAPH_CERTIFICATE_FILE` | Absolute path reference to the registered PEM X.509 certificate; a regular owned non-symlink certificate may be readable as `0644`, but not group/world writable |
+| `MICROSOFT_GRAPH_PRIVATE_KEY_FILE` | Absolute path reference to the RSA PKCS#1 or unencrypted PKCS#8 PEM private key; require a regular, non-symlink `0600` file outside Git |
+| `MICROSOFT_GRAPH_CERTIFICATE_KEY_ID` | Optional strict UUID for the registered Entra certificate `kid` header |
+| `MICROSOFT_GRAPH_CERTIFICATE_THUMBPRINT` | Optional 40-hex-character SHA-1 certificate thumbprint checked against the certificate file |
 
 Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).
 

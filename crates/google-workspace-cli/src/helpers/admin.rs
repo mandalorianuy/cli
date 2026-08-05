@@ -25,6 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod ip_intelligence;
+mod microsoft_graph_auth;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -1035,7 +1036,9 @@ fn build_security_observer_cmd() -> Command {
                 .long("microsoft-graph")
                 .requires("include-posture")
                 .action(ArgAction::SetTrue)
-                .help("Include Microsoft 365 posture and signals using MICROSOFT_GRAPH_ACCESS_TOKEN"),
+                .help(
+                    "Include Microsoft 365 posture and signals using MICROSOFT_GRAPH_ACCESS_TOKEN, or certificate auth from MICROSOFT_GRAPH_TENANT_ID, MICROSOFT_GRAPH_CLIENT_ID, MICROSOFT_GRAPH_CERTIFICATE_FILE, and MICROSOFT_GRAPH_PRIVATE_KEY_FILE; optionally set MICROSOFT_GRAPH_CERTIFICATE_KEY_ID",
+                ),
         )
         .arg(
             Arg::new("inactive-days")
@@ -1368,21 +1371,6 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         .get_one::<u32>("inactive-days")
         .copied()
         .unwrap_or(90) as i64;
-    let microsoft_token = if include_microsoft {
-        Some(
-            std::env::var(security_posture::MICROSOFT_GRAPH_TOKEN_ENV)
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-                .ok_or_else(|| {
-                    GwsError::Auth(format!(
-                        "Microsoft Graph was requested but {} is not set",
-                        security_posture::MICROSOFT_GRAPH_TOKEN_ENV
-                    ))
-                })?,
-        )
-    } else {
-        None
-    };
     let config = security_observer_config(matches);
 
     let end_time = Utc::now();
@@ -1390,6 +1378,12 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
     let start_rfc3339 = start_time.to_rfc3339_opts(SecondsFormat::Secs, true);
     let end_rfc3339 = end_time.to_rfc3339_opts(SecondsFormat::Secs, true);
     let requests = security_observer_requests(&start_rfc3339, max_results);
+    let client = crate::client::build_client()?;
+    let microsoft_token = if include_microsoft {
+        Some(microsoft_graph_auth::resolve_access_token(&client).await?)
+    } else {
+        None
+    };
     let mut scopes: Vec<&str> = requests.iter().map(|request| request.scope).collect();
     if include_posture {
         scopes.extend([
@@ -1402,7 +1396,6 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
     let token = auth::get_token(&scopes)
         .await
         .map_err(|error| GwsError::Auth(format!("Authentication failed: {error:#}")))?;
-    let client = crate::client::build_client()?;
 
     let mut activities = Vec::new();
     for request in &requests {
@@ -1446,7 +1439,7 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
             security_posture::collect_security_posture(
                 &client,
                 &token,
-                microsoft_token.as_deref(),
+                microsoft_token.as_ref().map(|token| token.as_str()),
                 &google_signal_contexts,
                 end_time,
                 inactive_days,
@@ -1556,6 +1549,23 @@ mod tests {
 
         assert!(names.contains(&"+admin-observer"));
         assert!(names.contains(&"+security-observer"));
+    }
+
+    #[test]
+    fn microsoft_graph_help_names_durable_certificate_configuration() {
+        let help = build_security_observer_cmd().render_help().to_string();
+
+        for variable in [
+            "MICROSOFT_GRAPH_TENANT_ID",
+            "MICROSOFT_GRAPH_CLIENT_ID",
+            "MICROSOFT_GRAPH_CERTIFICATE_FILE",
+            "MICROSOFT_GRAPH_PRIVATE_KEY_FILE",
+        ] {
+            assert!(
+                help.contains(variable),
+                "Microsoft certificate configuration should document {variable}"
+            );
+        }
     }
 
     #[test]

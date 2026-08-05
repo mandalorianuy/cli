@@ -51,6 +51,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 base64 = "0.22.1"
 derive_builder = "0.20.2"
+jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+libc = "0.2"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 chrono = "0.4.44"
@@ -61,12 +63,15 @@ mail-builder = "0.4"
 async-trait = "0.1.89"
 toml = "0.8"
 percent-encoding = "2.3.2"
+rsa = "0.9.10"
+sha1 = "0.10"
 zeroize = { version = "1.8.2", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 uuid = { version = "1.22.0", features = ["v4", "v5"] }
 mime_guess2 = "2.3.1"
+x509-parser = "0.18.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }
@@ -78,4 +83,5 @@ keyring = { version = "3.6.3", features = ["windows-native"] }
 keyring = "3.6.3"
 
 [dev-dependencies]
+rcgen = "0.13.2"
 serial_test = "3.4.0"

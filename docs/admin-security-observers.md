@@ -306,6 +306,16 @@ entities. Coverage is explicit per source: unavailable required sources set
 clean claim. The included email object is a deterministic payload template for
 downstream delivery; the observer itself does not send email or mutate cases.
 
+The contract also declares `lifecycleSchemas` so scheduled consumers can fail
+closed on a stable persistence boundary instead of inferring a row layout. The
+current values are `posture_finding_v1`, `posture_case_v1`, and
+`posture_recommendation_v1`. These schemas intentionally remain separate from
+audit-event sheets: posture `findingId` values are snapshot/control identities,
+not provider `eventId` values. A lifecycle consumer must preserve human status,
+reviewer, disposition, notes, notification state, and first-seen timestamps on
+an existing exact ID; repeated observation may update last-seen and fresh
+allowlisted evidence but must not create duplicates.
+
 Initial stable controls include:
 
 - `GOOGLE.IDENTITY.ADMIN_WITHOUT_2SV` and

@@ -19,8 +19,6 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub(super) const MICROSOFT_GRAPH_TOKEN_ENV: &str = "MICROSOFT_GRAPH_ACCESS_TOKEN";
-
 pub(super) const GOOGLE_USER_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.directory.user.readonly";
 pub(super) const GOOGLE_ROLE_SCOPE: &str =

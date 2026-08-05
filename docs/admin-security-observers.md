@@ -177,9 +177,11 @@ The report also includes:
 
 ## Microsoft 365 and cross-cloud posture
 
-Microsoft integration is opt-in and uses an independently obtained, read-only
-Graph token. The helper does not register an Entra application, request admin
-consent, refresh the token, or write it to disk:
+Microsoft integration is opt-in. An explicitly supplied
+`MICROSOFT_GRAPH_ACCESS_TOKEN` remains the highest-priority override; it is
+used as-is for compatibility and certificate files are not read when it is
+present. The helper does not register an Entra application, request admin
+consent, refresh a refresh token, or write an access token to disk:
 
 ```bash
 export MICROSOFT_GRAPH_ACCESS_TOKEN="<short-lived-read-only-token>"
@@ -189,6 +191,54 @@ gws admin-reports +security-observer \
   --include-posture \
   --microsoft-graph
 ```
+
+For unattended runs without an explicit access token, configure certificate
+client credentials with environment values that contain references, never key
+bytes:
+
+```bash
+export MICROSOFT_GRAPH_TENANT_ID="00000000-0000-0000-0000-000000000000"
+export MICROSOFT_GRAPH_CLIENT_ID="00000000-0000-0000-0000-000000000000"
+export MICROSOFT_GRAPH_CERTIFICATE_FILE="/secure/nexa-wsso/certificate.pem"
+export MICROSOFT_GRAPH_PRIVATE_KEY_FILE="/secure/nexa-wsso/private-key.pem"
+# Optional, but recommended when the Entra key identifier is known:
+export MICROSOFT_GRAPH_CERTIFICATE_KEY_ID="00000000-0000-0000-0000-000000000000"
+# Optional SHA-1 thumbprint assertion, 40 hexadecimal characters:
+export MICROSOFT_GRAPH_CERTIFICATE_THUMBPRINT="0123456789ABCDEF0123456789ABCDEF01234567"
+```
+
+The tenant and client IDs are strict hyphenated UUIDs. The certificate file
+must be one PEM-encoded X.509 certificate, and the private key must be an RSA
+PKCS#1 or unencrypted PKCS#8 PEM key. On Unix/macOS both files must be regular,
+non-symlink files owned by the executing user. The private key must use exact
+mode `0600`; the public certificate may use standard readable mode `0644`, but
+neither file may be group/world writable and their parent directory must also
+be owned by that user and not group/world writable. The certificate must be
+currently valid, RSA, and match the private key. The optional thumbprint is
+checked against the certificate. A missing, partial, malformed, mismatched,
+expired, or insecure configuration fails closed with a bounded authentication
+code; it never becomes disabled or clean.
+
+The client assertion is signed in memory with RS256, has a unique `jti`, a
+tenanted fixed `aud`/issuer/subject, and certificate `x5t`, `x5t#S256`, and
+optional `kid` headers. The token request is always the fixed HTTPS endpoint
+`https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` with
+`grant_type=client_credentials` and
+`scope=https://graph.microsoft.com/.default`. Assertions, private-key bytes,
+access tokens, and provider response bodies are memory-only and are not copied
+to logs, errors, observer JSON, or monitor records. The response must be a
+Bearer token with at least five minutes of lifetime and all seven configured
+Graph application roles; otherwise the run fails closed. A session reuses the
+token while it remains beyond the 60-second expiry skew; a new scheduled
+process acquires a new token.
+
+For a scheduled runner, place the two PEM files in a dedicated directory with
+`0700` directory permissions, load only the variable names above from the
+runner's protected environment/configuration, and keep the PEM files outside
+Git. Rotate by installing the new certificate/key pair, updating the optional
+key ID/thumbprint references, validating the new pair, and only then removing
+the old pair. Never put the private key or an access token in command-line
+arguments, `.env` committed to a repository, fixtures, receipts, or reports.
 
 Do not reuse a write-capable operational identity. Consent and licensing are
 external authority gates. Grant only the permissions for the sources that the

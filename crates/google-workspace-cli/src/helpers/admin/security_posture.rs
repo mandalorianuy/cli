@@ -113,14 +113,10 @@ pub(super) fn microsoft_graph_requests(start_time: &str) -> Vec<ReadOnlyRequest>
             source: "microsoft.roleAssignments".to_string(),
             method: reqwest::Method::GET,
             url: format!("{graph}/roleManagement/directory/roleAssignments"),
-            query: vec![
-                (
-                    "$expand".to_string(),
-                    "roleDefinition($select=id,displayName),principal($select=id,userPrincipalName)"
-                        .to_string(),
-                ),
-                ("$select".to_string(), "id,principalId,roleDefinitionId".to_string()),
-            ],
+            query: vec![(
+                "$select".to_string(),
+                "id,principalId,roleDefinitionId".to_string(),
+            )],
             item_key: "value",
         },
         ReadOnlyRequest {
@@ -1778,6 +1774,27 @@ mod tests {
             request.method == reqwest::Method::GET
                 && request.url.starts_with("https://graph.microsoft.com/v1.0/")
         }));
+    }
+
+    #[test]
+    fn role_assignments_query_requests_only_fields_consumed_by_analyzer() {
+        let request = microsoft_graph_requests("2026-08-01T00:00:00Z")
+            .into_iter()
+            .find(|request| request.source == "microsoft.roleAssignments")
+            .expect("roleAssignments request must be present");
+
+        assert_eq!(request.method, reqwest::Method::GET);
+        assert_eq!(
+            request.url,
+            "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments"
+        );
+        assert_eq!(
+            request.query,
+            vec![(
+                "$select".to_string(),
+                "id,principalId,roleDefinitionId".to_string()
+            )]
+        );
     }
 
     #[test]

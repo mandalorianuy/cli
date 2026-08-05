@@ -26,6 +26,7 @@ use std::pin::Pin;
 
 mod ip_intelligence;
 mod microsoft_graph_auth;
+mod monitor_contract;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -1470,21 +1471,38 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
         "recommendations": recommendations,
     });
     if let Some(posture) = security_posture {
-        report
-            .as_object_mut()
-            .expect("security observer report is an object")
-            .insert(
-                "securityPosture".to_string(),
-                serde_json::to_value(posture).map_err(|error| {
-                    GwsError::Other(anyhow::anyhow!(
-                        "Could not serialize security posture report: {error}"
-                    ))
-                })?,
-            );
+        insert_security_posture(&mut report, posture)?;
     }
     let format = crate::formatter::OutputFormat::parse(output_format)
         .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
     println!("{}", crate::formatter::format_value(&report, &format));
+    Ok(())
+}
+
+fn insert_security_posture(
+    report: &mut Value,
+    posture: security_posture::SecurityPostureReport,
+) -> Result<(), GwsError> {
+    let monitor_integration = monitor_contract::build_monitor_integration(&posture);
+    let report_object = report
+        .as_object_mut()
+        .expect("security observer report is an object");
+    report_object.insert(
+        "securityPosture".to_string(),
+        serde_json::to_value(posture).map_err(|error| {
+            GwsError::Other(anyhow::anyhow!(
+                "Could not serialize security posture report: {error}"
+            ))
+        })?,
+    );
+    report_object.insert(
+        "monitorIntegration".to_string(),
+        serde_json::to_value(monitor_integration).map_err(|error| {
+            GwsError::Other(anyhow::anyhow!(
+                "Could not serialize monitor integration contract: {error}"
+            ))
+        })?,
+    );
     Ok(())
 }
 
@@ -1523,6 +1541,29 @@ impl Helper for AdminHelper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn posture_report_adds_versioned_monitor_integration_contract() {
+        let posture = security_posture::SecurityPostureReport {
+            schema_version: "security_intelligence_v1",
+            generated_at: "2026-08-05T12:00:00Z".to_string(),
+            coverage_complete: true,
+            coverage: Vec::new(),
+            identity_count: 0,
+            identity_posture: Vec::new(),
+            control_posture: Vec::new(),
+            cross_cloud_correlations: Vec::new(),
+            signal_findings: Vec::new(),
+            microsoft_secure_score: None,
+        };
+        let mut report = json!({"mode": "read-only"});
+
+        insert_security_posture(&mut report, posture).expect("posture should serialize");
+
+        assert!(report
+            .pointer("/monitorIntegration/security_intelligence_monitor_v1")
+            .is_some());
+    }
 
     fn test_config() -> SecurityObserverConfig {
         SecurityObserverConfig {

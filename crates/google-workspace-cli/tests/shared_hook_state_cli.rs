@@ -1,5 +1,6 @@
 use base64::Engine;
 use serde_json::{json, Value};
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +10,16 @@ const PRE_COMMIT_BYTES: &[u8] = b"precommit-authority\n";
 const PRE_COMMIT_SHA256: &str = "bb3b9766964cfe4b473b36650b5fdefc016c308b9c3eb5d4aef9bc6691f8e6f3";
 const CHECKSUM_BYTES: &[u8] = b"checksum-authority\n";
 const CHECKSUM_SHA256: &str = "1b242e7759d9174dc49e0b2df7858f2e375b29bbed5d21d2673d3871c633d181";
+
+fn command_without_inherited_git_context(program: &str) -> Command {
+    let mut command = Command::new(program);
+    for (name, _) in env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
 
 fn present_expected(sha256: &str, mode: &str, bytes: &[u8]) -> Value {
     json!({
@@ -74,7 +85,7 @@ fn proposed_contract() -> Value {
 
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("fixture tempdir");
-    let status = Command::new("git")
+    let status = command_without_inherited_git_context("git")
         .args(["init", "--quiet"])
         .current_dir(dir.path())
         .status()
@@ -101,7 +112,7 @@ fn run_fixture(root: &Path) -> (Value, i32) {
 }
 
 fn run_fixture_args(root: &Path, args: &[&str]) -> (Value, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_gws"))
+    let output = command_without_inherited_git_context(env!("CARGO_BIN_EXE_gws"))
         .args(args)
         .current_dir(root)
         .output()
@@ -134,7 +145,7 @@ fn drift_kinds(result: &Value) -> Vec<&str> {
 
 #[test]
 fn shared_hook_state_is_structured_and_fail_closed_when_proposal_is_active() {
-    let output = Command::new(env!("CARGO_BIN_EXE_gws"))
+    let output = command_without_inherited_git_context(env!("CARGO_BIN_EXE_gws"))
         .arg("shared-hook-state")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()

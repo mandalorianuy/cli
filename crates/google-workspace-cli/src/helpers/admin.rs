@@ -27,6 +27,10 @@ use std::pin::Pin;
 mod ip_intelligence;
 mod microsoft_graph_auth;
 mod monitor_contract;
+mod monitor_correlation;
+mod monitor_cutover;
+mod monitor_program;
+mod provenance;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -47,6 +51,7 @@ const DIRECTORY_CHROMEOS_READONLY_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.directory.device.chromeos.readonly";
 const DIRECTORY_MOBILE_READONLY_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.directory.device.mobile.readonly";
+const MAX_CORRELATION_INPUT_BYTES: u64 = 1_048_576;
 
 struct ObserverRequest {
     application_name: &'static str,
@@ -82,6 +87,8 @@ struct Finding {
     rule: &'static str,
     reason: &'static str,
     actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::ProvenanceV1>,
     ip_address: Option<String>,
     occurrences: usize,
     evidence: BTreeMap<String, String>,
@@ -311,6 +318,7 @@ fn finding_from_event(
     rule: &'static str,
     principal: (String, Option<String>),
 ) -> Finding {
+    let (actor, ip_address) = principal;
     let mut evidence = BTreeMap::new();
     for name in [
         "affected_email_address",
@@ -341,7 +349,10 @@ fn finding_from_event(
         "visibility",
         "visibility_change",
     ] {
-        let values = event_string_values(event, name);
+        let values = event_string_values(event, name)
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
         if !values.is_empty() {
             evidence.insert(name.to_string(), values.join(", "));
         } else if event_bool_parameter(event, name) {
@@ -365,8 +376,13 @@ fn finding_from_event(
         severity,
         rule,
         reason: reason_for_rule(rule),
-        actor: principal.0,
-        ip_address: principal.1,
+        actor: actor.clone(),
+        provenance: Some(google_finding_provenance(
+            event,
+            &actor,
+            metadata.event_time.as_deref(),
+        )),
+        ip_address,
         occurrences: 1,
         evidence,
         target: event_string_parameter(event, "target_user")
@@ -391,6 +407,20 @@ fn finding_from_event(
         originating_app_id: event_string_parameter(event, "originating_app_id"),
         ip_intelligence: None,
     }
+}
+
+fn google_finding_provenance(
+    event: &Value,
+    actor: &str,
+    event_time: Option<&str>,
+) -> provenance::ProvenanceV1 {
+    if provenance::validated_email(actor).is_some() {
+        return provenance::ProvenanceV1::google_actor(actor, event_time);
+    }
+    if event_string_parameter(event, "resource_owner_email").is_some() {
+        return provenance::ProvenanceV1::google_resource_owner(event_time);
+    }
+    provenance::ProvenanceV1::google_unknown(event_time)
 }
 
 fn reason_for_rule(rule: &str) -> &'static str {
@@ -511,12 +541,7 @@ fn analyze_activities(
             let Some(event_name) = event.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let resource_owner = event_string_parameter(event, "resource_owner_email");
-            let effective_actor = if actor == "(unknown)" {
-                resource_owner.unwrap_or_else(|| actor.clone())
-            } else {
-                actor.clone()
-            };
+            let effective_actor = actor.clone();
             let doc_id = event_string_parameter(event, "doc_id")
                 .or_else(|| event_string_parameter(event, "resource_id"))
                 .unwrap_or_else(|| metadata.event_id(event_name, event_index));
@@ -713,27 +738,34 @@ fn analyze_activities(
         failed_logins
             .into_iter()
             .filter(|(_, burst)| burst.count >= 5)
-            .map(|(actor, burst)| Finding {
-                event_id: burst.latest.burst_event_id(),
-                event_time: burst.latest.event_time,
-                source: burst.latest.source,
-                event_name: "login_failure_aggregate".to_string(),
-                severity: Severity::High,
-                rule: "repeated_login_failures",
-                reason: reason_for_rule("repeated_login_failures"),
-                actor,
-                ip_address: burst.ip_address,
-                occurrences: burst.count,
-                evidence: BTreeMap::from([(
-                    "failed_login_count".to_string(),
-                    burst.count.to_string(),
-                )]),
-                target: None,
-                resource_id: None,
-                resource_type: None,
-                visibility: None,
-                originating_app_id: None,
-                ip_intelligence: None,
+            .map(|(actor, burst)| {
+                let provenance = provenance::ProvenanceV1::google_actor(
+                    &actor,
+                    burst.latest.event_time.as_deref(),
+                );
+                Finding {
+                    event_id: burst.latest.burst_event_id(),
+                    event_time: burst.latest.event_time,
+                    source: burst.latest.source,
+                    event_name: "login_failure_aggregate".to_string(),
+                    severity: Severity::High,
+                    rule: "repeated_login_failures",
+                    reason: reason_for_rule("repeated_login_failures"),
+                    actor,
+                    provenance: Some(provenance),
+                    ip_address: burst.ip_address,
+                    occurrences: burst.count,
+                    evidence: BTreeMap::from([(
+                        "failed_login_count".to_string(),
+                        burst.count.to_string(),
+                    )]),
+                    target: None,
+                    resource_id: None,
+                    resource_type: None,
+                    visibility: None,
+                    originating_app_id: None,
+                    ip_intelligence: None,
+                }
             }),
     );
 
@@ -770,31 +802,37 @@ fn drive_burst_findings(
     bursts
         .into_iter()
         .filter(|(_, burst)| burst.document_ids.len() >= threshold)
-        .map(|(key, burst)| Finding {
-            event_id: format!("{}:{}:{rule}", burst.latest.source, burst.latest.qualifier),
-            event_time: burst.latest.event_time,
-            source: burst.latest.source,
-            event_name: "drive_activity_aggregate".to_string(),
-            severity: Severity::High,
-            rule,
-            reason: reason_for_rule(rule),
-            actor: key
+        .map(|(key, burst)| {
+            let actor = key
                 .split('\u{1f}')
                 .next()
                 .unwrap_or("(unknown)")
-                .to_string(),
-            ip_address: burst.ip_address,
-            occurrences: burst.document_ids.len(),
-            evidence: BTreeMap::from([(
-                "unique_resource_count".to_string(),
-                burst.document_ids.len().to_string(),
-            )]),
-            target: None,
-            resource_id: None,
-            resource_type: None,
-            visibility: None,
-            originating_app_id: burst.originating_app_id,
-            ip_intelligence: None,
+                .to_string();
+            let provenance =
+                provenance::ProvenanceV1::google_actor(&actor, burst.latest.event_time.as_deref());
+            Finding {
+                event_id: format!("{}:{}:{rule}", burst.latest.source, burst.latest.qualifier),
+                event_time: burst.latest.event_time,
+                source: burst.latest.source,
+                event_name: "drive_activity_aggregate".to_string(),
+                severity: Severity::High,
+                rule,
+                reason: reason_for_rule(rule),
+                actor,
+                provenance: Some(provenance),
+                ip_address: burst.ip_address,
+                occurrences: burst.document_ids.len(),
+                evidence: BTreeMap::from([(
+                    "unique_resource_count".to_string(),
+                    burst.document_ids.len().to_string(),
+                )]),
+                target: None,
+                resource_id: None,
+                resource_type: None,
+                visibility: None,
+                originating_app_id: burst.originating_app_id,
+                ip_intelligence: None,
+            }
         })
         .collect()
 }
@@ -1060,6 +1098,144 @@ fn build_security_observer_cmd() -> Command {
         .after_help(
             "READ-ONLY GUARANTEE:\n  Uses only Google Admin and optional Microsoft Graph GET requests.\n  Never suspends users, revokes tokens, changes 2SV, modifies devices, or changes policies.",
         )
+}
+
+fn build_security_monitor_plan_cmd() -> Command {
+    Command::new("+security-monitor-plan")
+        .about("[Helper] Compile a Security Intelligence Monitor cutover bundle without external effects")
+        .arg(
+            Arg::new("input")
+                .long("input")
+                .required(true)
+                .value_name("FILE")
+                .help("Read-only observer report containing monitorIntegration"),
+        )
+        .arg(
+            Arg::new("existing")
+                .long("existing")
+                .required(true)
+                .value_name("FILE")
+                .help("Local monitor target snapshot with schemaVersion, records, and optional revision/hash guards"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .action(ArgAction::SetTrue)
+                .help("Required: emit a local bundle only; never write a Sheet or send email"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads only the two local JSON files.\n  The command never calls Google Sheets, Gmail, Microsoft Graph, or any writer.\n  A schema or coverage gate failure is represented as blocked in the bundle.\n  The notification phase is always suppressed until a separately authorized writer completes readback.",
+        )
+}
+
+fn build_security_monitor_correlate_cmd() -> Command {
+    Command::new("+security-monitor-correlate")
+        .about("[Helper] Correlate an existing security observer report without external effects")
+        .arg(
+            Arg::new("input")
+                .long("input")
+                .required(true)
+                .value_name("FILE")
+                .help("Local read-only security observer report JSON"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .required(true)
+                .action(ArgAction::SetTrue)
+                .help("Required: emit only a bounded local correlation view"),
+        )
+        .arg(
+            Arg::new("window-minutes")
+                .long("window-minutes")
+                .value_parser(value_parser!(u64).range(1..=1_440))
+                .default_value("30")
+                .value_name("MINUTES")
+                .help("Maximum event-time distance allowed for a correlation"),
+        )
+        .arg(
+            Arg::new("max-correlations")
+                .long("max-correlations")
+                .value_parser(value_parser!(u32).range(1..=100))
+                .default_value("50")
+                .value_name("COUNT")
+                .help("Maximum deterministic correlation records to emit"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads one bounded local JSON file only.\n  Never calls Google Admin, Microsoft Graph, Sheets, Gmail, a writer, or a notifier.\n  Missing, disabled, unavailable, contradictory, stale, or overflowing evidence remains fail-closed and requires human review.",
+        )
+}
+
+fn build_security_monitor_program_cmd() -> Command {
+    Command::new("+security-monitor-program")
+        .about("[Helper] Compile and simulate a local Security Intelligence Monitor execution program")
+        .arg(
+            Arg::new("bundle")
+                .long("bundle")
+                .required(true)
+                .value_name("FILE")
+                .help("T3b cutover bundle JSON; it is never sent to an external service"),
+        )
+        .arg(
+            Arg::new("target")
+                .long("target")
+                .required(true)
+                .value_name("FILE")
+                .help("Pinned local target snapshot JSON"),
+        )
+        .arg(
+            Arg::new("policy")
+                .long("policy")
+                .required(true)
+                .value_name("FILE")
+                .help("Explicit local writer policy JSON; presence is not human approval"),
+        )
+        .arg(
+            Arg::new("simulate")
+                .long("simulate")
+                .required(true)
+                .action(ArgAction::SetTrue)
+                .help("Required: run only the deterministic local receipt simulator"),
+        )
+        .arg(
+            Arg::new("failure-phase")
+                .long("failure-phase")
+                .value_name("PHASE")
+                .value_parser(parse_security_monitor_failure_phase)
+                .help("Optional local simulation fault; it cannot enable external writes"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"])
+                .default_value("json")
+                .value_name("FORMAT"),
+        )
+        .after_help(
+            "NO-EFFECT GUARANTEE:\n  Reads only the three local JSON files.\n  Compiles typed requests and receipts; it never calls Sheets, Gmail, Google Admin, Microsoft Graph, or any writer.\n  All simulations keep externalWritesAllowed=false, liveApplyAvailable=false, and notification=suppress.",
+        )
+}
+
+fn parse_security_monitor_failure_phase(value: &str) -> Result<String, String> {
+    if monitor_program::failure_phase_names().contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("unknown failure phase '{value}'"))
+    }
 }
 
 fn security_observer_config(matches: &ArgMatches) -> SecurityObserverConfig {
@@ -1434,6 +1610,9 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
                 actor: finding.actor.clone(),
                 rule: finding.rule.to_string(),
                 event_time: finding.event_time.clone(),
+                provenance: finding.provenance.unwrap_or_else(|| {
+                    provenance::ProvenanceV1::google_unknown(finding.event_time.as_deref())
+                }),
             })
             .collect::<Vec<_>>();
         Some(
@@ -1506,6 +1685,176 @@ fn insert_security_posture(
     Ok(())
 }
 
+fn read_monitor_plan_json(path: &str, flag_name: &str) -> Result<Value, GwsError> {
+    let safe_path = crate::validate::validate_safe_file_path(path, flag_name)?;
+    let contents = std::fs::read_to_string(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not read monitor plan input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    serde_json::from_str(&contents).map_err(|error| {
+        GwsError::Validation(format!(
+            "Monitor plan input is not valid JSON: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })
+}
+
+fn read_security_monitor_correlation_json(path: &str) -> Result<Value, GwsError> {
+    let safe_path = crate::validate::validate_safe_file_path(path, "--input")?;
+    let metadata = std::fs::metadata(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not inspect correlation input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    if metadata.len() > MAX_CORRELATION_INPUT_BYTES {
+        return Err(GwsError::Validation(format!(
+            "Correlation input exceeds the {MAX_CORRELATION_INPUT_BYTES}-byte safety bound"
+        )));
+    }
+    let contents = std::fs::read_to_string(&safe_path).map_err(|error| {
+        GwsError::Validation(format!(
+            "Could not read correlation input: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })?;
+    if contents.len() as u64 > MAX_CORRELATION_INPUT_BYTES {
+        return Err(GwsError::Validation(format!(
+            "Correlation input exceeds the {MAX_CORRELATION_INPUT_BYTES}-byte safety bound"
+        )));
+    }
+    serde_json::from_str(&contents).map_err(|error| {
+        GwsError::Validation(format!(
+            "Correlation input is not valid JSON: {}",
+            sanitize_for_terminal(&error.to_string())
+        ))
+    })
+}
+
+fn handle_security_monitor_plan(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("dry-run") {
+        return Err(GwsError::Validation(
+            "+security-monitor-plan requires --dry-run; external cutover is not implemented"
+                .to_string(),
+        ));
+    }
+    let input_path = matches
+        .get_one::<String>("input")
+        .expect("input is required by clap");
+    let existing_path = matches
+        .get_one::<String>("existing")
+        .expect("existing is required by clap");
+    let input = read_monitor_plan_json(input_path, "--input")?;
+    let existing = read_monitor_plan_json(existing_path, "--existing")?;
+    let bundle = monitor_cutover::build_cutover_bundle(&input, &existing).map_err(|error| {
+        GwsError::Validation(format!("Monitor cutover bundle rejected: {error}"))
+    })?;
+    let value = serde_json::to_value(bundle).map_err(|error| {
+        GwsError::Other(anyhow::anyhow!(
+            "Could not serialize monitor cutover bundle: {error}"
+        ))
+    })?;
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&value, &format));
+    Ok(())
+}
+
+fn handle_security_monitor_correlate(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("dry-run") {
+        return Err(GwsError::Validation(
+            "+security-monitor-correlate requires --dry-run; external correlation is not implemented"
+                .to_string(),
+        ));
+    }
+    let input_path = matches
+        .get_one::<String>("input")
+        .expect("input is required by clap");
+    let window_minutes = matches
+        .get_one::<u64>("window-minutes")
+        .copied()
+        .unwrap_or(30);
+    let max_correlations = matches
+        .get_one::<u32>("max-correlations")
+        .copied()
+        .unwrap_or(50) as usize;
+    let input = read_security_monitor_correlation_json(input_path)?;
+    let output = monitor_correlation::correlate_report(&input, window_minutes, max_correlations)
+        .map_err(|error| GwsError::Validation(format!("Security correlation rejected: {error}")))?;
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&output, &format));
+    Ok(())
+}
+
+fn handle_security_monitor_program(matches: &ArgMatches) -> Result<(), GwsError> {
+    if !matches.get_flag("simulate") {
+        return Err(GwsError::Validation(
+            "+security-monitor-program requires --simulate; external execution is not implemented"
+                .to_string(),
+        ));
+    }
+    let bundle_path = matches
+        .get_one::<String>("bundle")
+        .expect("bundle is required by clap");
+    let target_path = matches
+        .get_one::<String>("target")
+        .expect("target is required by clap");
+    let policy_path = matches
+        .get_one::<String>("policy")
+        .expect("policy is required by clap");
+    let bundle = read_monitor_plan_json(bundle_path, "--bundle")?;
+    let target = read_monitor_plan_json(target_path, "--target")?;
+    let policy = read_monitor_plan_json(policy_path, "--policy")?;
+    let program =
+        monitor_program::compile_execution_program(&bundle, &target, &policy).map_err(|error| {
+            GwsError::Validation(format!("Monitor execution program rejected: {error}"))
+        })?;
+    let failure_phase = matches
+        .get_one::<String>("failure-phase")
+        .map(String::as_str);
+    let simulation =
+        monitor_program::simulate_execution_program(&program, failure_phase).map_err(|error| {
+            GwsError::Validation(format!("Monitor execution simulation rejected: {error}"))
+        })?;
+    let replay = if failure_phase.is_none() {
+        Some(
+            monitor_program::replay_execution_program(&program, &simulation).map_err(|error| {
+                GwsError::Validation(format!("Monitor execution replay rejected: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let output = json!({
+        "program": program,
+        "simulation": simulation,
+        "replay": replay,
+        "externalWritesAllowed": false,
+        "liveApplyAvailable": false,
+        "notificationEffective": "suppress",
+        "humanAuthorizationRequired": true,
+    });
+    let output_format = matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("json");
+    let format = crate::formatter::OutputFormat::parse(output_format)
+        .map_err(|unknown| GwsError::Validation(format!("Unknown output format '{unknown}'")))?;
+    println!("{}", crate::formatter::format_value(&output, &format));
+    Ok(())
+}
+
 impl Helper for AdminHelper {
     fn inject_commands(
         &self,
@@ -1514,6 +1863,9 @@ impl Helper for AdminHelper {
     ) -> Command {
         cmd = cmd.subcommand(build_admin_observer_cmd());
         cmd = cmd.subcommand(build_security_observer_cmd());
+        cmd = cmd.subcommand(build_security_monitor_plan_cmd());
+        cmd = cmd.subcommand(build_security_monitor_correlate_cmd());
+        cmd = cmd.subcommand(build_security_monitor_program_cmd());
         cmd
     }
 
@@ -1530,6 +1882,20 @@ impl Helper for AdminHelper {
             }
             if let Some(observer_matches) = matches.subcommand_matches("+security-observer") {
                 handle_security_observer(observer_matches).await?;
+                return Ok(true);
+            }
+            if let Some(plan_matches) = matches.subcommand_matches("+security-monitor-plan") {
+                handle_security_monitor_plan(plan_matches)?;
+                return Ok(true);
+            }
+            if let Some(correlation_matches) =
+                matches.subcommand_matches("+security-monitor-correlate")
+            {
+                handle_security_monitor_correlate(correlation_matches)?;
+                return Ok(true);
+            }
+            if let Some(program_matches) = matches.subcommand_matches("+security-monitor-program") {
+                handle_security_monitor_program(program_matches)?;
                 return Ok(true);
             }
             Ok(false)
@@ -1590,6 +1956,9 @@ mod tests {
 
         assert!(names.contains(&"+admin-observer"));
         assert!(names.contains(&"+security-observer"));
+        assert!(names.contains(&"+security-monitor-plan"));
+        assert!(names.contains(&"+security-monitor-correlate"));
+        assert!(names.contains(&"+security-monitor-program"));
     }
 
     #[test]
@@ -1607,6 +1976,120 @@ mod tests {
                 "Microsoft certificate configuration should document {variable}"
             );
         }
+    }
+
+    #[test]
+    fn security_monitor_correlation_command_is_local_and_bounded() {
+        let matches = build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--window-minutes",
+                "60",
+                "--max-correlations",
+                "25",
+            ])
+            .expect("bounded local correlation arguments should parse");
+
+        assert!(matches.get_flag("dry-run"));
+        assert_eq!(matches.get_one::<u64>("window-minutes"), Some(&60));
+        assert_eq!(matches.get_one::<u32>("max-correlations"), Some(&25));
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+            ])
+            .is_err());
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--window-minutes",
+                "0",
+            ])
+            .is_err());
+        assert!(build_security_monitor_correlate_cmd()
+            .try_get_matches_from([
+                "+security-monitor-correlate",
+                "--input",
+                "evidence/report.json",
+                "--dry-run",
+                "--max-correlations",
+                "101",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn security_monitor_plan_command_is_explicitly_dry_run() {
+        let matches = build_security_monitor_plan_cmd()
+            .try_get_matches_from([
+                "+security-monitor-plan",
+                "--input",
+                "evidence/report.json",
+                "--existing",
+                "evidence/monitor-target.json",
+                "--dry-run",
+            ])
+            .expect("monitor plan arguments should parse");
+
+        assert!(matches.get_flag("dry-run"));
+        assert_eq!(
+            matches.get_one::<String>("input").map(String::as_str),
+            Some("evidence/report.json")
+        );
+        assert_eq!(
+            matches.get_one::<String>("existing").map(String::as_str),
+            Some("evidence/monitor-target.json")
+        );
+    }
+
+    #[test]
+    fn security_monitor_plan_rejects_implicit_external_execution() {
+        let matches = build_security_monitor_plan_cmd()
+            .try_get_matches_from([
+                "+security-monitor-plan",
+                "--input",
+                "evidence/report.json",
+                "--existing",
+                "evidence/monitor-target.json",
+            ])
+            .expect("arguments should parse before the explicit dry-run gate");
+
+        let error = handle_security_monitor_plan(&matches)
+            .expect_err("live execution must not be available");
+        assert!(error.to_string().contains("requires --dry-run"));
+    }
+
+    #[test]
+    fn security_monitor_program_requires_explicit_local_simulation() {
+        let matches = build_security_monitor_program_cmd()
+            .try_get_matches_from([
+                "+security-monitor-program",
+                "--bundle",
+                "evidence/bundle.json",
+                "--target",
+                "evidence/target.json",
+                "--policy",
+                "evidence/policy.json",
+                "--simulate",
+                "--failure-phase",
+                "findings_writes",
+            ])
+            .expect("program arguments should parse");
+
+        assert!(matches.get_flag("simulate"));
+        assert_eq!(
+            matches
+                .get_one::<String>("failure-phase")
+                .map(String::as_str),
+            Some("findings_writes")
+        );
     }
 
     #[test]
@@ -1842,6 +2325,7 @@ mod tests {
             rule: "password_leak",
             reason: reason_for_rule("password_leak"),
             actor: "user@wearenexa.com".to_string(),
+            provenance: None,
             ip_address: Some("203.0.113.30".to_string()),
             occurrences: 1,
             evidence: BTreeMap::new(),
@@ -1867,6 +2351,86 @@ mod tests {
         assert_eq!(value["ipAddress"], "203.0.113.30");
         assert_eq!(value["occurrences"], 1);
         assert!(value.get("ipIntelligence").is_none());
+    }
+
+    #[test]
+    fn google_explicit_actor_has_versioned_provenance() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "login",
+                "uniqueQualifier": "google-actor",
+                "time": "2026-08-02T12:01:00Z"
+            },
+            "actor": {"email": "Admin@Example.com"},
+            "events": [{"name": "suspicious_login"}]
+        })]);
+        let value = serde_json::to_value(&findings[0]).expect("finding should serialize");
+
+        assert_eq!(
+            value["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "humanUser",
+                "actorSource": "googleActor",
+                "temporalBasis": "providerEventTime"
+            })
+        );
+    }
+
+    #[test]
+    fn google_resource_owner_without_actor_is_not_promoted_to_actor() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "rules",
+                "uniqueQualifier": "resource-owner",
+                "time": "2026-08-02T12:02:00Z"
+            },
+            "events": [{
+                "name": "content_matched",
+                "parameters": [
+                    {"name": "rule_type", "value": "DLP"},
+                    {"name": "resource_owner_email", "value": "owner@wearenexa.com"},
+                    {"name": "resource_id", "value": "resource-1"}
+                ]
+            }]
+        })]);
+        let value = serde_json::to_value(&findings[0]).expect("finding should serialize");
+
+        assert_eq!(value["actor"], "(unknown)");
+        assert_eq!(
+            value["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "resourceOwner",
+                "actorSource": "googleResourceOwner",
+                "temporalBasis": "providerEventTime"
+            })
+        );
+        assert!(!serde_json::to_string(&value)
+            .expect("finding should serialize")
+            .contains("owner@wearenexa.com"));
+    }
+
+    #[test]
+    fn omits_empty_event_parameter_values_from_finding_evidence() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "rules",
+                "uniqueQualifier": "synthetic-empty-evidence",
+                "time": "2026-08-02T12:01:00Z"
+            },
+            "actor": {"email": "first@example.com"},
+            "events": [{
+                "name": "message_send_warned",
+                "parameters": [
+                    {"name": "severity", "value": ""},
+                    {"name": "resource_id", "value": "message-<synthetic@example.invalid>"}
+                ]
+            }]
+        })]);
+
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].evidence.contains_key("severity"));
     }
 
     #[test]
@@ -1897,6 +2461,7 @@ mod tests {
                 rule: "two_step_verification_disabled",
                 reason: reason_for_rule("two_step_verification_disabled"),
                 actor: "user@wearenexa.com".to_string(),
+                provenance: None,
                 ip_address: None,
                 occurrences: 1,
                 evidence: BTreeMap::new(),
@@ -1916,6 +2481,7 @@ mod tests {
                 rule: "password_leak",
                 reason: reason_for_rule("password_leak"),
                 actor: "user@wearenexa.com".to_string(),
+                provenance: None,
                 ip_address: None,
                 occurrences: 1,
                 evidence: BTreeMap::new(),
@@ -2194,7 +2760,7 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, "dlp_content_match");
-        assert_eq!(findings[0].actor, "owner@wearenexa.com");
+        assert_eq!(findings[0].actor, "(unknown)");
         assert_eq!(
             findings[0]
                 .evidence
@@ -2210,6 +2776,27 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn resource_context_does_not_substitute_for_a_missing_actor() {
+        let activities = vec![json!({
+            "id": {"applicationName": "admin", "uniqueQualifier": "context-only-1"},
+            "events": [{
+                "name": "message_send_warned",
+                "parameters": [
+                    {"name": "resource_owner_email", "value": "owner@wearenexa.com"},
+                    {"name": "target_user", "value": "recipient@example.net"},
+                    {"name": "affected_email_address", "value": "affected@example.net"}
+                ]
+            }]
+        })];
+
+        let findings = test_analyze(&activities);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].actor, "(unknown)");
+        assert_eq!(findings[0].target.as_deref(), Some("recipient@example.net"));
     }
 
     #[test]

@@ -345,6 +345,108 @@ happened; a recommendation records a proposed human decision. Recommended
 states are `proposed`, `accepted`, `rejected`, and `implemented`. The observer
 never changes a recommendation state and never applies a DLP or sharing rule.
 
+### Fail-closed provenance (T10-CORR4)
+
+Findings and correlations use `security_intelligence_provenance_v1` to keep
+actor role/source separate from temporal evidence. Human actor correlation is
+eligible only for a validated Google actor or Microsoft `initiatedBy.user`
+paired with provider event time. Resource owners, targets, affected users,
+subjects, opaque IDs, applications, systems, snapshots, and `lastLoginTime`
+remain context and are never promoted to human causality.
+
+Missing or non-provider time stays fail-closed. Snapshot `generatedAt` and
+`observedAt` describe collection context; they do not establish when a causal
+event occurred. Historical inputs remain readable but cannot pass actor/time
+correlation gates without the explicit provenance fields.
+
+### Local context correlation (T7)
+
+`+security-monitor-correlate` reads one bounded observer JSON file and produces
+the separate `security_intelligence_monitor_correlation_v1` contract. It is
+local-only, requires `--dry-run`, and never calls Google Admin, Microsoft Graph,
+Sheets, Gmail, a writer, or a notifier.
+
+```bash
+gws admin-reports +security-monitor-correlate \
+  --input ./evidence/security-observer.json \
+  --dry-run \
+  --window-minutes 30 \
+  --max-correlations 50
+```
+
+Correlation requires exact normalized actor/email, resource, OAuth client,
+target, or rule keys and bounded event times. IDs and fingerprints are
+deterministic; evidence is allowlisted and human-review fields remain empty.
+Incomplete, stale, contradictory, ambiguous, unsafe, or overflowing inputs stay
+fail-closed. IP context is observation only and never proves identity or safety.
+
+### Controlled cutover planner and bundle compiler (T3/T3b)
+
+`+security-monitor-plan` is a local, deterministic planner for a later
+synchronizer. It accepts a complete read-only observer report plus a local
+monitor-target snapshot and emits bounded `create`, `update`, `noop`, and
+`suppress` operations. It never calls Sheets, Gmail, Google Admin, Microsoft
+Graph, or another writer, and it requires `--dry-run`.
+
+The compiled `security_intelligence_monitor_cutover_bundle_v1` adds canonical
+input/target fingerprints, exact preconditions, an additive schema manifest,
+ordered Sheet request manifests, per-key readback assertions, rollback/no-effect
+instructions, and a separate notification phase. Notification remains
+suppressed until a separately authorized writer completes exact readback.
+
+Only the additive target `schemaVersion=7` is eligible for planning. Version 6
+and incomplete coverage remain blocked with `externalWritesAllowed=false`.
+Human-owned status, disposition, notes, owner, reviewer, decision, and
+resolution fields are never included in an automatic patch. Conflicting
+duplicates, unknown sources, non-allowlisted URLs, formula-like values, and
+unknown recommendation references fail closed.
+
+Optional `stateFingerprint` and `inputFingerprint` guards reject stale local
+snapshots. The bundle keeps `sheets.externalWritesAllowed=false`,
+`notification.effective=suppress`, and all no-effect flags false for writes and
+delivery. It cannot create tabs, update cells, send email, or mutate credentials.
+
+```bash
+gws admin-reports +security-monitor-plan \
+  --input ./evidence/security-observer.json \
+  --existing ./evidence/monitor-target.json \
+  --dry-run \
+  --format json
+```
+
+`eligible_pending_authorization` is engineering readiness only. It does not
+authorize a schema migration, provider write, notification, production effect,
+or human acceptance. A future writer still requires separate authorization,
+backup, exact target binding, and post-write readback.
+
+### Offline execution program and receipt simulator (T4)
+
+`+security-monitor-program` compiles an eligible cutover bundle, exact target
+snapshot, and explicit writer policy into a canonically hashed local execution
+program. `--simulate` is mandatory; no live writer is implemented. The fixed
+phase order covers admission, backup pinning, additive migration, the three tab
+manifests, exact readback, commit-or-rollback, and notification handoff.
+
+```bash
+gws admin-reports +security-monitor-program \
+  --bundle ./evidence/security-monitor-bundle.json \
+  --target ./evidence/monitor-target-snapshot.json \
+  --policy ./evidence/security-monitor-writer-policy.json \
+  --simulate \
+  --format json
+```
+
+Every phase emits a chained, fingerprinted receipt. Failure produces rollback
+evidence and permanently suppresses notification; an exact completed replay is
+a no-op. The policy is an input contract, not approval. All executable paths
+keep `externalWritesAllowed=false`, `liveApplyAvailable=false`, and
+`humanAuthorizationRequired=true`.
+
+The CLI routes both monitor helpers through a local synthetic command tree
+before Discovery resolution, so these offline paths do not fetch an external
+Discovery document. The T5 admission dossier records technical checks only; it
+does not confer live, provider-write, notification, or human authority.
+
 ## DLP discovery workflow
 
 Metadata alone cannot determine whether a document contains customer records,

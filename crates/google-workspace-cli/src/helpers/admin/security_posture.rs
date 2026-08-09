@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::provenance::{ActorSource, ProvenanceV1};
 use crate::error::GwsError;
 use crate::output::sanitize_for_terminal;
 use chrono::{DateTime, Duration, Utc};
@@ -277,6 +278,9 @@ pub(super) struct PostureFinding {
     pub contextual_verdict: ContextualVerdict,
     pub title: String,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub provenance: ProvenanceV1,
     pub summary: String,
     pub evidence: BTreeMap<String, String>,
     pub analysis: HumanAnalysis,
@@ -305,6 +309,7 @@ pub(super) struct GoogleSignalContext {
     pub actor: String,
     pub rule: String,
     pub event_time: Option<String>,
+    pub provenance: ProvenanceV1,
 }
 
 impl IdentityRecord {
@@ -764,6 +769,8 @@ fn finding(
     title: impl Into<String>,
     summary: impl Into<String>,
     evidence: BTreeMap<String, String>,
+    actor: Option<String>,
+    provenance: ProvenanceV1,
     analysis: HumanAnalysis,
 ) -> PostureFinding {
     PostureFinding {
@@ -774,6 +781,8 @@ fn finding(
         contextual_verdict: ContextualVerdict::Alert,
         title: title.into(),
         subject: subject.to_string(),
+        actor,
+        provenance,
         summary: summary.into(),
         evidence,
         analysis,
@@ -862,6 +871,8 @@ pub(super) fn analyze_google_posture(
                 title,
                 "La cuenta está habilitada y Google informa que no está enrolada en 2SV; una contraseña comprometida podría bastar para acceder.",
                 evidence,
+                None,
+                ProvenanceV1::snapshot_affected_user(),
                 HumanAnalysis {
                     conclusion: format!("Google Workspace informa una cuenta {} activa sin enrolamiento en 2SV.", if privileged { "administrativa" } else { "de usuario" }),
                     escalation_reason: if privileged { "La cuenta conserva privilegios administrativos y carece de un segundo factor registrado." } else { "La cuenta puede iniciar sesión y carece de un segundo factor registrado." }.to_string(),
@@ -895,6 +906,8 @@ pub(super) fn analyze_google_posture(
                             ("lastLoginTime".to_string(), last_login.to_rfc3339()),
                             ("inactiveDays".to_string(), days.to_string()),
                         ]),
+                        None,
+                        ProvenanceV1::last_login_state(),
                         HumanAnalysis {
                             conclusion: format!("Cuenta de Google habilitada sin inicios de sesión observados durante {days} días."),
                             escalation_reason: format!("La inactividad supera el umbral configurado de {inactive_days} días mientras el acceso permanece habilitado."),
@@ -1032,6 +1045,12 @@ pub(super) fn analyze_microsoft_posture(
                 title,
                 summary,
                 evidence,
+                None,
+                ProvenanceV1::new(
+                    super::provenance::ActorRole::AffectedUser,
+                    ActorSource::ProviderSubject,
+                    super::provenance::TemporalBasis::SnapshotGeneratedAt,
+                ),
                 HumanAnalysis {
                     conclusion: conclusion.to_string(),
                     escalation_reason: escalation_reason.to_string(),
@@ -1074,6 +1093,12 @@ pub(super) fn analyze_microsoft_posture(
             "No se observó una política MFA habilitada",
             "La colección devolvió políticas de Conditional Access, pero ninguna habilitada exige el control MFA.",
             BTreeMap::from([("policiesObserved".to_string(), policies.len().to_string())]),
+            None,
+            ProvenanceV1::new(
+                super::provenance::ActorRole::Subject,
+                ActorSource::ProviderSubject,
+                super::provenance::TemporalBasis::SnapshotGeneratedAt,
+            ),
             HumanAnalysis {
                 conclusion: "No se observó una política habilitada de Conditional Access que exija MFA.".to_string(),
                 escalation_reason: "Existen políticas legibles, pero ninguna combina state=enabled con el grant control mfa.".to_string(),
@@ -1115,12 +1140,18 @@ pub(super) fn analyze_microsoft_posture(
                 email,
                 "Usuario activo excluido de política MFA",
                 format!("La política habilitada '{policy_name}' exige MFA pero excluye explícitamente a esta cuenta."),
-                BTreeMap::from([
-                    ("policyId".to_string(), policy_id.to_string()),
-                    ("policyName".to_string(), policy_name.to_string()),
-                    ("accountEnabled".to_string(), "true".to_string()),
-                ]),
-                HumanAnalysis {
+                    BTreeMap::from([
+                        ("policyId".to_string(), policy_id.to_string()),
+                        ("policyName".to_string(), policy_name.to_string()),
+                        ("accountEnabled".to_string(), "true".to_string()),
+                    ]),
+                    None,
+                    ProvenanceV1::new(
+                        super::provenance::ActorRole::AffectedUser,
+                        ActorSource::ProviderSubject,
+                        super::provenance::TemporalBasis::SnapshotGeneratedAt,
+                    ),
+                    HumanAnalysis {
                     conclusion: format!("Una cuenta activa está excluida de la política MFA habilitada '{policy_name}'."),
                     escalation_reason: "La exclusión explícita evita que esta política exija MFA a la identidad.".to_string(),
                     plausible_impact: "La cuenta podría autenticarse sin el nivel de protección esperado si ninguna otra política aplicable compensa la exclusión.".to_string(),
@@ -1170,6 +1201,8 @@ pub(super) fn correlate_identities(
                     ("googleEnabled".to_string(), google_identity.enabled.to_string()),
                     ("microsoftEnabled".to_string(), microsoft_identity.enabled.to_string()),
                 ]),
+                None,
+                ProvenanceV1::cross_cloud_subject(),
                 HumanAnalysis {
                     conclusion: "La identidad correlacionada por email tiene estados activos diferentes entre Google Workspace y Microsoft 365.".to_string(),
                     escalation_reason: "Un sistema mantiene acceso habilitado mientras el otro lo informa deshabilitado.".to_string(),
@@ -1202,6 +1235,8 @@ pub(super) fn correlate_identities(
                     ("microsoftPrivileged".to_string(), microsoft_identity.privileged.to_string()),
                     ("microsoftMfaCapable".to_string(), microsoft_identity.mfa_capable.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())),
                 ]),
+                None,
+                ProvenanceV1::cross_cloud_subject(),
                 HumanAnalysis {
                     conclusion: "Una identidad correlacionada conserva privilegios y presenta una brecha explícita de MFA entre plataformas.".to_string(),
                     escalation_reason: "El privilegio amplifica el impacto potencial y al menos un proveedor informa protección MFA ausente o no-capable.".to_string(),
@@ -1217,6 +1252,36 @@ pub(super) fn correlate_identities(
         }
     }
     findings
+}
+
+fn directory_audit_provenance(
+    audit: &Value,
+    event_time: Option<&str>,
+) -> (Option<String>, ProvenanceV1) {
+    let initiated_by = audit.get("initiatedBy").and_then(Value::as_object);
+    if let Some(user) = initiated_by
+        .and_then(|value| value.get("user"))
+        .and_then(Value::as_object)
+    {
+        if let Some(upn) = user.get("userPrincipalName").and_then(Value::as_str) {
+            if let Some((actor, provenance)) = ProvenanceV1::microsoft_user_actor(upn, event_time) {
+                return (Some(actor), provenance);
+            }
+        }
+        if user.get("id").and_then(Value::as_str).is_some() {
+            return (None, ProvenanceV1::microsoft_opaque_id(event_time));
+        }
+    }
+    if initiated_by
+        .and_then(|value| value.get("app"))
+        .is_some_and(Value::is_object)
+    {
+        return (None, ProvenanceV1::microsoft_application(event_time));
+    }
+    (
+        None,
+        ProvenanceV1::microsoft_initiated_by_system(event_time),
+    )
 }
 
 pub(super) fn analyze_microsoft_signals(
@@ -1266,6 +1331,8 @@ pub(super) fn analyze_microsoft_signals(
                 ("riskState".to_string(), risk_state.to_string()),
                 ("conditionalAccessStatus".to_string(), conditional_access.to_string()),
             ]),
+            None,
+            ProvenanceV1::microsoft_sign_in_user(),
             HumanAnalysis {
                 conclusion: format!("Microsoft Entra registró un inicio de sesión de riesgo {risk_level} para una cuenta de la organización."),
                 escalation_reason: format!("La evaluación de riesgo es {risk_level} y el estado es {risk_state}; no se reduce por ubicación o red."),
@@ -1296,6 +1363,7 @@ pub(super) fn analyze_microsoft_signals(
         let activity = string_field(audit, "activityDisplayName").unwrap_or("directory change");
         let time = string_field(audit, "activityDateTime").unwrap_or("unknown");
         let critical = matches!(category, "RoleManagement" | "Policy");
+        let (actor, provenance) = directory_audit_provenance(audit, Some(time));
         findings.push(finding(
             "MSFT.SIGNAL.DIRECTORY_CHANGE",
             "microsoft365",
@@ -1310,6 +1378,8 @@ pub(super) fn analyze_microsoft_signals(
                 ("category".to_string(), category.to_string()),
                 ("result".to_string(), result.to_string()),
             ]),
+            actor,
+            provenance,
             HumanAnalysis {
                 conclusion: format!("Se ejecutó con éxito un cambio de directorio de tipo {category}: {activity}."),
                 escalation_reason: "El cambio afecta privilegios, políticas, aplicaciones o identidades y requiere atribución a una operación autorizada.".to_string(),
@@ -1351,6 +1421,8 @@ pub(super) fn analyze_microsoft_signals(
                 ("status".to_string(), status.to_string()),
                 ("serviceSource".to_string(), source.to_string()),
             ]),
+            None,
+            ProvenanceV1::microsoft_defender(Some(time)),
             HumanAnalysis {
                 conclusion: format!("Microsoft Defender emitió una alerta {severity_text}: {title}."),
                 escalation_reason: "La severidad del proveedor alcanza el piso de escalamiento y la alerta todavía requiere validación humana.".to_string(),
@@ -1390,6 +1462,8 @@ pub(super) fn analyze_microsoft_signals(
                 ("severity".to_string(), severity_text.to_string()),
                 ("status".to_string(), status.to_string()),
             ]),
+            None,
+            ProvenanceV1::microsoft_defender(Some(time)),
             HumanAnalysis {
                 conclusion: format!("Microsoft Defender informa un incidente {severity_text}: {title}."),
                 escalation_reason: "El incidente agrupa señales de alta severidad y exige revisar alcance y entidades relacionadas.".to_string(),
@@ -1419,17 +1493,17 @@ pub(super) fn correlate_cross_cloud_signals(
         "suspicious_successful_login",
     ]);
     let mut findings = Vec::new();
-    for google in google_signals
-        .iter()
-        .filter(|signal| risky_google_rules.contains(signal.rule.as_str()))
-    {
-        let Some(normalized_actor) = normalized_email_for_correlation(&google.actor) else {
+    for google in google_signals.iter().filter(|signal| {
+        risky_google_rules.contains(signal.rule.as_str())
+            && signal.provenance.actor_correlation_eligible()
+    }) {
+        let Some(normalized_actor) = super::provenance::validated_email(&google.actor) else {
             continue;
         };
         for microsoft in microsoft_signals.iter().filter(|signal| {
             signal.control_id == "MSFT.SIGNAL.RISKY_SIGN_IN"
-                && normalized_email_for_correlation(&signal.subject).as_deref()
-                    == Some(normalized_actor.as_str())
+                && signal.provenance.actor_correlation_eligible()
+                && signal.actor.as_deref() == Some(normalized_actor.as_str())
         }) {
             let microsoft_id = microsoft
                 .evidence
@@ -1448,6 +1522,8 @@ pub(super) fn correlate_cross_cloud_signals(
                     ("googleRule".to_string(), google.rule.clone()),
                     ("microsoftSignInId".to_string(), microsoft_id.to_string()),
                 ]),
+                None,
+                ProvenanceV1::cross_cloud_subject(),
                 HumanAnalysis {
                     conclusion: "La misma identidad presenta una señal de acceso sospechoso en Google Workspace y otra de riesgo en Microsoft Entra dentro de la ventana.".to_string(),
                     escalation_reason: "La coincidencia exacta por email entre dos proveedores independientes eleva la probabilidad de un problema de identidad que atraviesa plataformas.".to_string(),
@@ -1881,6 +1957,87 @@ mod tests {
     }
 
     #[test]
+    fn microsoft_initiated_by_user_upn_is_an_explicit_human_actor() {
+        let audits = json!([{
+            "id": "audit-user-1",
+            "activityDateTime": "2026-08-01T11:40:00Z",
+            "activityDisplayName": "Add member",
+            "category": "UserManagement",
+            "result": "success",
+            "initiatedBy": {
+                "user": {"userPrincipalName": "Admin@Example.com"}
+            }
+        }]);
+
+        let finding = analyze_microsoft_signals(&[], audits.as_array().unwrap(), &[], &[])
+            .into_iter()
+            .next()
+            .expect("directory audit should produce a finding");
+        let value = serde_json::to_value(finding).expect("finding must serialize");
+
+        assert_eq!(value["actor"], "admin@example.com");
+        assert_eq!(
+            value["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "humanUser",
+                "actorSource": "microsoftInitiatedByUser",
+                "temporalBasis": "providerEventTime"
+            })
+        );
+    }
+
+    #[test]
+    fn microsoft_app_system_and_opaque_ids_keep_actor_uncertain() {
+        let audits = json!([
+            {
+                "id": "audit-app-1",
+                "activityDateTime": "2026-08-01T11:41:00Z",
+                "activityDisplayName": "Update application",
+                "category": "ApplicationManagement",
+                "result": "success",
+                "initiatedBy": {"app": {"appId": "opaque-app", "displayName": "Automation"}}
+            },
+            {
+                "id": "audit-system-1",
+                "activityDateTime": "2026-08-01T11:42:00Z",
+                "activityDisplayName": "Update policy",
+                "category": "Policy",
+                "result": "success",
+                "initiatedBy": {}
+            },
+            {
+                "id": "audit-opaque-user-1",
+                "activityDateTime": "2026-08-01T11:43:00Z",
+                "activityDisplayName": "Update user",
+                "category": "UserManagement",
+                "result": "success",
+                "initiatedBy": {"user": {"id": "opaque-user-id"}}
+            }
+        ]);
+
+        let mut findings = analyze_microsoft_signals(&[], audits.as_array().unwrap(), &[], &[]);
+        let serialized = findings
+            .drain(..)
+            .map(|finding| serde_json::to_value(finding).expect("finding must serialize"))
+            .collect::<Vec<_>>();
+
+        assert!(serialized.iter().all(|finding| finding["actor"].is_null()));
+        assert!(serialized.iter().any(|finding| {
+            finding["provenance"]["actorRole"] == "application"
+                && finding["provenance"]["actorSource"] == "microsoftInitiatedByApp"
+        }));
+        assert!(serialized.iter().any(|finding| {
+            finding["provenance"]["actorRole"] == "system"
+                && finding["provenance"]["actorSource"] == "microsoftInitiatedBySystem"
+        }));
+        assert!(serialized.iter().any(|finding| {
+            finding["provenance"]["actorRole"] == "unknown"
+                && finding["provenance"]["actorSource"] == "microsoftInitiatedByOpaqueId"
+        }));
+    }
+
+    #[test]
     fn high_defender_alert_is_preserved_as_actionable_signal() {
         let alerts = json!([{
             "id": "alert-1",
@@ -1903,12 +2060,16 @@ mod tests {
     }
 
     #[test]
-    fn risky_signals_for_same_identity_across_clouds_are_correlated() {
+    fn risky_sign_in_affected_user_is_not_promoted_to_cross_cloud_actor() {
         let google = vec![GoogleSignalContext {
             event_id: "login:g-1:suspicious_login:0".to_string(),
             actor: "person@example.com".to_string(),
             rule: "google_suspicious_login".to_string(),
             event_time: Some("2026-08-01T11:20:00Z".to_string()),
+            provenance: ProvenanceV1::google_actor(
+                "person@example.com",
+                Some("2026-08-01T11:20:00Z"),
+            ),
         }];
         let microsoft = analyze_microsoft_signals(
             json!([{
@@ -1927,13 +2088,7 @@ mod tests {
 
         let correlations = correlate_cross_cloud_signals(&google, &microsoft);
 
-        let finding = correlations
-            .iter()
-            .find(|finding| finding.control_id == "CROSS.SIGNAL.MULTITENANT_SUSPICIOUS_LOGIN")
-            .expect("same-identity risky signals should correlate");
-        assert_eq!(finding.severity, PostureSeverity::Critical);
-        assert!(finding.analysis.evidence_for.len() >= 2);
-        assert!(finding.analysis.is_complete());
+        assert!(correlations.is_empty());
     }
 
     #[test]
@@ -1943,6 +2098,7 @@ mod tests {
             actor: "signin-unknown".to_string(),
             rule: "google_suspicious_login".to_string(),
             event_time: None,
+            provenance: ProvenanceV1::google_unknown(None),
         }];
         let microsoft = analyze_microsoft_signals(
             json!([{

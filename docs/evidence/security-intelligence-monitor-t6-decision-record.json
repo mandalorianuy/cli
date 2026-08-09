@@ -1,0 +1,165 @@
+{
+  "artifact": "security_intelligence_monitor_t6_operational_decision_record_v1",
+  "schemaVersion": 1,
+  "plan": "inteligencia multicloud read-only y cutover gobernado",
+  "review": {
+    "status": "READY_FOR_DECISION",
+    "decision": "UNDECIDED",
+    "actor": "",
+    "fecha": "",
+    "alcance": ""
+  },
+  "auditBase": {
+    "head": "b14f6dc486cca556961a905f52c45451ce2510f9",
+    "parent": "fe259345cc0c13228907c03fe2d58250c3097e1e",
+    "mergeBaseWithT2": "aa0e46e8c4e90ab2f72e6fc5b08c06bbc574f98d",
+    "requiredBranch": "codex/security-intelligence-monitor-admission-t5"
+  },
+  "sourceEvidence": {
+    "dossier": "docs/evidence/security-intelligence-monitor-t5-admission.md",
+    "dossierSha256": "sha256:e0ac27e18de440d9a9dabc7dba8862c4e19bbcb2cff8406531d7b553f3e53ee0",
+    "technicalAdmission": "T5 PASS técnico; no equivale a aprobación operativa, humana, de producción ni efecto vivo"
+  },
+  "gates": [
+    {
+      "id": "technical_admission_t3_t3b_t4",
+      "status": "ACCEPTED",
+      "availableEvidence": [
+        "Código local, schemas, validadores, tests focales y simulación offline en el HEAD exacto",
+        "Dossier T5 con límites explícitos de no-efecto"
+      ],
+      "missingEvidence": [],
+      "authorityRequired": "Ninguna autoridad viva; esta aceptación sólo cubre la admisión técnica local",
+      "safeConsequence": "Mantener writer, notifier, migración viva y cutover deshabilitados"
+    },
+    {
+      "id": "schema_7_approval",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Manifest de migración aditiva 6->7 y rechazo fail-closed de schema 6",
+        "Validación local de columnas y preservación de campos humanos"
+      ],
+      "missingEvidence": [
+        "Aprobación humana explícita del schema 7 y de la migración append-only"
+      ],
+      "authorityRequired": "Product Owner o custodio humano del schema",
+      "safeConsequence": "No aprobar schema 7 ni mutar schema 6"
+    },
+    {
+      "id": "real_tenant_and_spreadsheet_identity",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Contrato local que exige tenantId y spreadsheetId",
+        "Validadores de identidad, formato, revisión/etag y fingerprint"
+      ],
+      "missingEvidence": [
+        "Identidad real del tenant y spreadsheet objetivo, reconciliada por un humano",
+        "Snapshot real con revision o etag y fingerprint retenido"
+      ],
+      "authorityRequired": "Custodio humano del tenant y del spreadsheet",
+      "safeConsequence": "No seleccionar target vivo ni habilitar escrituras"
+    },
+    {
+      "id": "real_backup_and_restore",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Manifest local de backup pinning, rollback y retención del snapshot",
+        "Simulación local de rollback y rollback failure"
+      ],
+      "missingEvidence": [
+        "Backup inmutable real",
+        "Restore real probado y dueño operativo de la restauración"
+      ],
+      "authorityRequired": "Dueño operativo de backup/restore",
+      "safeConsequence": "No ejecutar migración ni writes; ante cualquier intento, bloquear"
+    },
+    {
+      "id": "real_readback",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Assertions locales por tab, rango, key, record y campos humanos",
+        "Gate local que suprime notifier cuando readback no es exitoso"
+      ],
+      "missingEvidence": [
+        "Readback contra el servicio real después de cada operación autorizada",
+        "Reconciliación independiente de las assertions y del estado final"
+      ],
+      "authorityRequired": "Dueño del writer y revisor operativo independiente",
+      "safeConsequence": "No enviar notificación y restaurar desde backup si ya hubiera ocurrido una escritura autorizada"
+    },
+    {
+      "id": "to_bcc_policy",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Policy local tipada con roles To/Bcc separados, no vacíos y sin placeholders",
+        "Validación local de duplicados y dominios inválidos"
+      ],
+      "missingEvidence": [
+        "Aprobación humana de los destinatarios y de la política To/Bcc"
+      ],
+      "authorityRequired": "Custodio humano de la política de notificación",
+      "safeConsequence": "Mantener recipients unresolved y notifier suppressed"
+    },
+    {
+      "id": "writer_and_notifier_authority",
+      "status": "PENDING",
+      "availableEvidence": [
+        "No existe adapter writer ni notifier vivo en T5",
+        "El programa local exige autorización humana y liveApplyAvailable=false"
+      ],
+      "missingEvidence": [
+        "Autorización separada para un futuro writer",
+        "Autorización separada para un futuro notifier"
+      ],
+      "authorityRequired": "Autoridades humanas separadas para Sheet writer y notification sender",
+      "safeConsequence": "No implementar ni ejecutar writer/notifier como consecuencia de este T6"
+    },
+    {
+      "id": "operational_and_human_acceptance",
+      "status": "PENDING",
+      "availableEvidence": [
+        "Checklist local de decisión y residuales T5",
+        "Este registro con decisión explícitamente UNDECIDED"
+      ],
+      "missingEvidence": [
+        "Decisión humana explícita con actor, fecha y alcance completos",
+        "Aceptación operativa observable"
+      ],
+      "authorityRequired": "Product Owner o autoridad humana designada",
+      "safeConsequence": "No declarar aceptación, certificación, producción ni cutover"
+    },
+    {
+      "id": "cutover_email_and_production_effect",
+      "status": "NOT_AUTHORIZED",
+      "execution": "NOT_DONE",
+      "availableEvidence": [
+        "Boundary local de no-efecto y comandos que sólo aceptan --dry-run/--simulate"
+      ],
+      "missingEvidence": [
+        "Autorización explícita de cutover",
+        "Evidencia viva de migración, email, producción y efecto externo"
+      ],
+      "authorityRequired": "Autoridad humana de producción/cutover",
+      "safeConsequence": "Permanecer sin efecto externo; cualquier ruta apply/live queda fuera de alcance"
+    }
+  ],
+  "failClosed": {
+    "externalWritesAllowed": false,
+    "liveApplyAvailable": false,
+    "emailAllowed": false,
+    "writerAuthorized": false,
+    "notifierAuthorized": false,
+    "schema7Approved": false,
+    "schema6MutationAllowed": false,
+    "cutoverAuthorized": false,
+    "productionEffectObserved": false,
+    "credentialsChanged": false
+  },
+  "nextPermittedAction": {
+    "kind": "human_operational_evidence_review",
+    "requiresExplicitHumanDecision": true,
+    "description": "Revisar este registro y decidir qué evidencia viva autorizar o recolectar; esta acción no autoriza writer, notifier, migración, cutover ni producción.",
+    "humanReviewPermitted": true,
+    "liveEvidenceCollectionAuthorized": false
+  }
+}

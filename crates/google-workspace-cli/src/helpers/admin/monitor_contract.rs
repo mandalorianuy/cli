@@ -1,3 +1,4 @@
+use super::provenance::{validated_email, ProvenanceV1};
 use super::security_posture::{
     Confidence, ContextualVerdict, CoverageStatus, PostureFinding, PostureSeverity,
     SecurityPostureReport, Urgency,
@@ -122,6 +123,7 @@ pub(super) struct MonitorFinding {
     source: &'static str,
     source_kind: SourceKind,
     observed_at: String,
+    provenance: ProvenanceV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     event_time: Option<String>,
     raw_severity: String,
@@ -335,8 +337,17 @@ fn normalize_finding(finding: &PostureFinding, observed_at: &str) -> Option<Moni
         &why_it_matters,
         &what_we_do_not_know,
     );
-    let event_time = event_time(&evidence);
-    let actor = actor_for_subject(&finding.subject);
+    let event_time = finding
+        .provenance
+        .temporal_correlation_eligible()
+        .then(|| event_time(&evidence))
+        .flatten();
+    let actor = finding
+        .provenance
+        .actor_correlation_eligible()
+        .then_some(finding.actor.as_deref())
+        .flatten()
+        .and_then(validated_email);
     let links = links_for_source_kind(source_kind);
 
     Some(MonitorFinding {
@@ -347,6 +358,7 @@ fn normalize_finding(finding: &PostureFinding, observed_at: &str) -> Option<Moni
         source,
         source_kind,
         observed_at: bounded_text(observed_at, 64),
+        provenance: finding.provenance,
         event_time,
         raw_severity,
         contextual_verdict,
@@ -658,31 +670,11 @@ fn safe_evidence_value(value: &str) -> Option<String> {
 }
 
 fn event_time(evidence: &BTreeMap<String, String>) -> Option<String> {
-    ["createdDateTime", "activityDateTime", "lastLoginTime"]
+    ["createdDateTime", "activityDateTime"]
         .iter()
         .filter_map(|key| evidence.get(*key))
         .find(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
         .cloned()
-}
-
-fn actor_for_subject(subject: &str) -> Option<String> {
-    let normalized = subject.trim().to_ascii_lowercase();
-    let (local, domain) = normalized.split_once('@')?;
-    if local.is_empty()
-        || domain.is_empty()
-        || normalized.len() > 254
-        || normalized
-            .chars()
-            .filter(|character| *character == '@')
-            .count()
-            != 1
-        || normalized
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return None;
-    }
-    Some(normalized)
 }
 
 fn normalized_subject(subject: &str) -> String {
@@ -808,6 +800,8 @@ mod tests {
             contextual_verdict: ContextualVerdict::Alert,
             title: "Administrador activo sin 2-Step Verification".to_string(),
             subject: subject.to_string(),
+            actor: None,
+            provenance: ProvenanceV1::snapshot_affected_user(),
             summary: "Google informa una cuenta habilitada sin enrolamiento en 2SV.".to_string(),
             evidence: BTreeMap::from([
                 ("isEnrolledIn2Sv".to_string(), "false".to_string()),
@@ -895,7 +889,51 @@ mod tests {
         assert!(left
             .pointer("/security_intelligence_monitor_v1/findings/0/eventId")
             .is_none());
-        assert_eq!(finding.actor.as_deref(), Some("admin@example.com"));
+        assert!(finding.actor.is_none());
+    }
+
+    #[test]
+    fn posture_subject_is_not_an_actor_and_snapshot_time_is_context_only() {
+        let report = sample_report(
+            vec![CoverageEntry::available("google.users")],
+            vec![sample_finding("Admin@example.com", "legacy-id")],
+        );
+
+        let value = serde_json::to_value(build_monitor_integration(&report))
+            .expect("contract must serialize");
+        let finding = &value["security_intelligence_monitor_v1"]["findings"][0];
+
+        assert!(finding["actor"].is_null());
+        assert_eq!(
+            finding["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "affectedUser",
+                "actorSource": "googlePostureSubject",
+                "temporalBasis": "snapshotGeneratedAt"
+            })
+        );
+    }
+
+    #[test]
+    fn last_login_state_is_not_emitted_as_a_causal_event_time() {
+        let mut finding = sample_finding("stale@example.com", "stale-id");
+        finding.evidence.insert(
+            "lastLoginTime".to_string(),
+            "2026-07-20T12:00:00Z".to_string(),
+        );
+        finding.provenance = ProvenanceV1::last_login_state();
+        let report = sample_report(
+            vec![CoverageEntry::available("google.users")],
+            vec![finding],
+        );
+
+        let value = serde_json::to_value(build_monitor_integration(&report))
+            .expect("contract must serialize");
+        let finding = &value["security_intelligence_monitor_v1"]["findings"][0];
+
+        assert!(finding["eventTime"].is_null());
+        assert_eq!(finding["provenance"]["temporalBasis"], "stateLastLoginTime");
     }
 
     #[test]
@@ -912,7 +950,7 @@ mod tests {
         let serialized = serde_json::to_string(&contract).expect("contract must serialize");
 
         assert!(normalized.quick_view.chars().count() <= 300);
-        assert_eq!(serialized.matches("person@example.com").count(), 1);
+        assert_eq!(serialized.matches("person@example.com").count(), 0);
         assert!(!serialized.contains("ipAddress"));
         assert!(!serialized.contains("203.0.113.9"));
     }
@@ -1061,6 +1099,7 @@ mod tests {
         let finding = first_finding(&contract);
 
         assert!(finding.actor.is_none());
+        assert!(finding.event_time.is_none());
         assert!(finding
             .assertions
             .iter()

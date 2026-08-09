@@ -30,6 +30,7 @@ mod monitor_contract;
 mod monitor_correlation;
 mod monitor_cutover;
 mod monitor_program;
+mod provenance;
 mod security_posture;
 
 pub struct AdminHelper;
@@ -86,6 +87,8 @@ struct Finding {
     rule: &'static str,
     reason: &'static str,
     actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::ProvenanceV1>,
     ip_address: Option<String>,
     occurrences: usize,
     evidence: BTreeMap<String, String>,
@@ -315,6 +318,7 @@ fn finding_from_event(
     rule: &'static str,
     principal: (String, Option<String>),
 ) -> Finding {
+    let (actor, ip_address) = principal;
     let mut evidence = BTreeMap::new();
     for name in [
         "affected_email_address",
@@ -345,7 +349,10 @@ fn finding_from_event(
         "visibility",
         "visibility_change",
     ] {
-        let values = event_string_values(event, name);
+        let values = event_string_values(event, name)
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
         if !values.is_empty() {
             evidence.insert(name.to_string(), values.join(", "));
         } else if event_bool_parameter(event, name) {
@@ -369,8 +376,13 @@ fn finding_from_event(
         severity,
         rule,
         reason: reason_for_rule(rule),
-        actor: principal.0,
-        ip_address: principal.1,
+        actor: actor.clone(),
+        provenance: Some(google_finding_provenance(
+            event,
+            &actor,
+            metadata.event_time.as_deref(),
+        )),
+        ip_address,
         occurrences: 1,
         evidence,
         target: event_string_parameter(event, "target_user")
@@ -395,6 +407,20 @@ fn finding_from_event(
         originating_app_id: event_string_parameter(event, "originating_app_id"),
         ip_intelligence: None,
     }
+}
+
+fn google_finding_provenance(
+    event: &Value,
+    actor: &str,
+    event_time: Option<&str>,
+) -> provenance::ProvenanceV1 {
+    if provenance::validated_email(actor).is_some() {
+        return provenance::ProvenanceV1::google_actor(actor, event_time);
+    }
+    if event_string_parameter(event, "resource_owner_email").is_some() {
+        return provenance::ProvenanceV1::google_resource_owner(event_time);
+    }
+    provenance::ProvenanceV1::google_unknown(event_time)
 }
 
 fn reason_for_rule(rule: &str) -> &'static str {
@@ -515,12 +541,7 @@ fn analyze_activities(
             let Some(event_name) = event.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let resource_owner = event_string_parameter(event, "resource_owner_email");
-            let effective_actor = if actor == "(unknown)" {
-                resource_owner.unwrap_or_else(|| actor.clone())
-            } else {
-                actor.clone()
-            };
+            let effective_actor = actor.clone();
             let doc_id = event_string_parameter(event, "doc_id")
                 .or_else(|| event_string_parameter(event, "resource_id"))
                 .unwrap_or_else(|| metadata.event_id(event_name, event_index));
@@ -717,27 +738,34 @@ fn analyze_activities(
         failed_logins
             .into_iter()
             .filter(|(_, burst)| burst.count >= 5)
-            .map(|(actor, burst)| Finding {
-                event_id: burst.latest.burst_event_id(),
-                event_time: burst.latest.event_time,
-                source: burst.latest.source,
-                event_name: "login_failure_aggregate".to_string(),
-                severity: Severity::High,
-                rule: "repeated_login_failures",
-                reason: reason_for_rule("repeated_login_failures"),
-                actor,
-                ip_address: burst.ip_address,
-                occurrences: burst.count,
-                evidence: BTreeMap::from([(
-                    "failed_login_count".to_string(),
-                    burst.count.to_string(),
-                )]),
-                target: None,
-                resource_id: None,
-                resource_type: None,
-                visibility: None,
-                originating_app_id: None,
-                ip_intelligence: None,
+            .map(|(actor, burst)| {
+                let provenance = provenance::ProvenanceV1::google_actor(
+                    &actor,
+                    burst.latest.event_time.as_deref(),
+                );
+                Finding {
+                    event_id: burst.latest.burst_event_id(),
+                    event_time: burst.latest.event_time,
+                    source: burst.latest.source,
+                    event_name: "login_failure_aggregate".to_string(),
+                    severity: Severity::High,
+                    rule: "repeated_login_failures",
+                    reason: reason_for_rule("repeated_login_failures"),
+                    actor,
+                    provenance: Some(provenance),
+                    ip_address: burst.ip_address,
+                    occurrences: burst.count,
+                    evidence: BTreeMap::from([(
+                        "failed_login_count".to_string(),
+                        burst.count.to_string(),
+                    )]),
+                    target: None,
+                    resource_id: None,
+                    resource_type: None,
+                    visibility: None,
+                    originating_app_id: None,
+                    ip_intelligence: None,
+                }
             }),
     );
 
@@ -774,31 +802,37 @@ fn drive_burst_findings(
     bursts
         .into_iter()
         .filter(|(_, burst)| burst.document_ids.len() >= threshold)
-        .map(|(key, burst)| Finding {
-            event_id: format!("{}:{}:{rule}", burst.latest.source, burst.latest.qualifier),
-            event_time: burst.latest.event_time,
-            source: burst.latest.source,
-            event_name: "drive_activity_aggregate".to_string(),
-            severity: Severity::High,
-            rule,
-            reason: reason_for_rule(rule),
-            actor: key
+        .map(|(key, burst)| {
+            let actor = key
                 .split('\u{1f}')
                 .next()
                 .unwrap_or("(unknown)")
-                .to_string(),
-            ip_address: burst.ip_address,
-            occurrences: burst.document_ids.len(),
-            evidence: BTreeMap::from([(
-                "unique_resource_count".to_string(),
-                burst.document_ids.len().to_string(),
-            )]),
-            target: None,
-            resource_id: None,
-            resource_type: None,
-            visibility: None,
-            originating_app_id: burst.originating_app_id,
-            ip_intelligence: None,
+                .to_string();
+            let provenance =
+                provenance::ProvenanceV1::google_actor(&actor, burst.latest.event_time.as_deref());
+            Finding {
+                event_id: format!("{}:{}:{rule}", burst.latest.source, burst.latest.qualifier),
+                event_time: burst.latest.event_time,
+                source: burst.latest.source,
+                event_name: "drive_activity_aggregate".to_string(),
+                severity: Severity::High,
+                rule,
+                reason: reason_for_rule(rule),
+                actor,
+                provenance: Some(provenance),
+                ip_address: burst.ip_address,
+                occurrences: burst.document_ids.len(),
+                evidence: BTreeMap::from([(
+                    "unique_resource_count".to_string(),
+                    burst.document_ids.len().to_string(),
+                )]),
+                target: None,
+                resource_id: None,
+                resource_type: None,
+                visibility: None,
+                originating_app_id: burst.originating_app_id,
+                ip_intelligence: None,
+            }
         })
         .collect()
 }
@@ -1576,6 +1610,9 @@ async fn handle_security_observer(matches: &ArgMatches) -> Result<(), GwsError> 
                 actor: finding.actor.clone(),
                 rule: finding.rule.to_string(),
                 event_time: finding.event_time.clone(),
+                provenance: finding.provenance.unwrap_or_else(|| {
+                    provenance::ProvenanceV1::google_unknown(finding.event_time.as_deref())
+                }),
             })
             .collect::<Vec<_>>();
         Some(
@@ -1925,6 +1962,23 @@ mod tests {
     }
 
     #[test]
+    fn microsoft_graph_help_names_durable_certificate_configuration() {
+        let help = build_security_observer_cmd().render_help().to_string();
+
+        for variable in [
+            "MICROSOFT_GRAPH_TENANT_ID",
+            "MICROSOFT_GRAPH_CLIENT_ID",
+            "MICROSOFT_GRAPH_CERTIFICATE_FILE",
+            "MICROSOFT_GRAPH_PRIVATE_KEY_FILE",
+        ] {
+            assert!(
+                help.contains(variable),
+                "Microsoft certificate configuration should document {variable}"
+            );
+        }
+    }
+
+    #[test]
     fn security_monitor_correlation_command_is_local_and_bounded() {
         let matches = build_security_monitor_correlate_cmd()
             .try_get_matches_from([
@@ -2010,23 +2064,6 @@ mod tests {
         let error = handle_security_monitor_plan(&matches)
             .expect_err("live execution must not be available");
         assert!(error.to_string().contains("requires --dry-run"));
-    }
-
-    #[test]
-    fn microsoft_graph_help_names_durable_certificate_configuration() {
-        let help = build_security_observer_cmd().render_help().to_string();
-
-        for variable in [
-            "MICROSOFT_GRAPH_TENANT_ID",
-            "MICROSOFT_GRAPH_CLIENT_ID",
-            "MICROSOFT_GRAPH_CERTIFICATE_FILE",
-            "MICROSOFT_GRAPH_PRIVATE_KEY_FILE",
-        ] {
-            assert!(
-                help.contains(variable),
-                "Microsoft certificate configuration should document {variable}"
-            );
-        }
     }
 
     #[test]
@@ -2288,6 +2325,7 @@ mod tests {
             rule: "password_leak",
             reason: reason_for_rule("password_leak"),
             actor: "user@wearenexa.com".to_string(),
+            provenance: None,
             ip_address: Some("203.0.113.30".to_string()),
             occurrences: 1,
             evidence: BTreeMap::new(),
@@ -2313,6 +2351,86 @@ mod tests {
         assert_eq!(value["ipAddress"], "203.0.113.30");
         assert_eq!(value["occurrences"], 1);
         assert!(value.get("ipIntelligence").is_none());
+    }
+
+    #[test]
+    fn google_explicit_actor_has_versioned_provenance() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "login",
+                "uniqueQualifier": "google-actor",
+                "time": "2026-08-02T12:01:00Z"
+            },
+            "actor": {"email": "Admin@Example.com"},
+            "events": [{"name": "suspicious_login"}]
+        })]);
+        let value = serde_json::to_value(&findings[0]).expect("finding should serialize");
+
+        assert_eq!(
+            value["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "humanUser",
+                "actorSource": "googleActor",
+                "temporalBasis": "providerEventTime"
+            })
+        );
+    }
+
+    #[test]
+    fn google_resource_owner_without_actor_is_not_promoted_to_actor() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "rules",
+                "uniqueQualifier": "resource-owner",
+                "time": "2026-08-02T12:02:00Z"
+            },
+            "events": [{
+                "name": "content_matched",
+                "parameters": [
+                    {"name": "rule_type", "value": "DLP"},
+                    {"name": "resource_owner_email", "value": "owner@wearenexa.com"},
+                    {"name": "resource_id", "value": "resource-1"}
+                ]
+            }]
+        })]);
+        let value = serde_json::to_value(&findings[0]).expect("finding should serialize");
+
+        assert_eq!(value["actor"], "(unknown)");
+        assert_eq!(
+            value["provenance"],
+            json!({
+                "contractVersion": "security_intelligence_provenance_v1",
+                "actorRole": "resourceOwner",
+                "actorSource": "googleResourceOwner",
+                "temporalBasis": "providerEventTime"
+            })
+        );
+        assert!(!serde_json::to_string(&value)
+            .expect("finding should serialize")
+            .contains("owner@wearenexa.com"));
+    }
+
+    #[test]
+    fn omits_empty_event_parameter_values_from_finding_evidence() {
+        let findings = test_analyze(&[json!({
+            "id": {
+                "applicationName": "rules",
+                "uniqueQualifier": "synthetic-empty-evidence",
+                "time": "2026-08-02T12:01:00Z"
+            },
+            "actor": {"email": "first@example.com"},
+            "events": [{
+                "name": "message_send_warned",
+                "parameters": [
+                    {"name": "severity", "value": ""},
+                    {"name": "resource_id", "value": "message-<synthetic@example.invalid>"}
+                ]
+            }]
+        })]);
+
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].evidence.contains_key("severity"));
     }
 
     #[test]
@@ -2343,6 +2461,7 @@ mod tests {
                 rule: "two_step_verification_disabled",
                 reason: reason_for_rule("two_step_verification_disabled"),
                 actor: "user@wearenexa.com".to_string(),
+                provenance: None,
                 ip_address: None,
                 occurrences: 1,
                 evidence: BTreeMap::new(),
@@ -2362,6 +2481,7 @@ mod tests {
                 rule: "password_leak",
                 reason: reason_for_rule("password_leak"),
                 actor: "user@wearenexa.com".to_string(),
+                provenance: None,
                 ip_address: None,
                 occurrences: 1,
                 evidence: BTreeMap::new(),
@@ -2640,7 +2760,7 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, "dlp_content_match");
-        assert_eq!(findings[0].actor, "owner@wearenexa.com");
+        assert_eq!(findings[0].actor, "(unknown)");
         assert_eq!(
             findings[0]
                 .evidence
@@ -2656,6 +2776,27 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn resource_context_does_not_substitute_for_a_missing_actor() {
+        let activities = vec![json!({
+            "id": {"applicationName": "admin", "uniqueQualifier": "context-only-1"},
+            "events": [{
+                "name": "message_send_warned",
+                "parameters": [
+                    {"name": "resource_owner_email", "value": "owner@wearenexa.com"},
+                    {"name": "target_user", "value": "recipient@example.net"},
+                    {"name": "affected_email_address", "value": "affected@example.net"}
+                ]
+            }]
+        })];
+
+        let findings = test_analyze(&activities);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].actor, "(unknown)");
+        assert_eq!(findings[0].target.as_deref(), Some("recipient@example.net"));
     }
 
     #[test]

@@ -5,6 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use uuid::Uuid;
 
+use super::provenance::{
+    validated_email, ActorRole, ActorSource, ProvenanceV1, TemporalBasis,
+    PROVENANCE_CONTRACT_VERSION,
+};
+
 pub(super) const CORRELATION_CONTRACT_VERSION: &str =
     "security_intelligence_monitor_correlation_v1";
 
@@ -164,6 +169,7 @@ struct Signal {
     source: String,
     event_time: Option<DateTime<Utc>>,
     actor: Option<String>,
+    provenance: Option<ProvenanceV1>,
     resource_id: Option<String>,
     client_id: Option<String>,
     target: Option<String>,
@@ -533,21 +539,22 @@ fn parse_raw_signal(
         RAW_EVIDENCE_KEYS,
         &format!("{path}.evidence"),
     )?;
-    let actor = optional_string(object, "actor", &format!("{path}.actor"))?.and_then(|value| {
-        match normalize_email(&value) {
-            Some(email) => Some(email),
-            None => {
-                missing_data.insert(format!("{path}.actor:ambiguous_or_missing"));
-                None
-            }
-        }
-    });
-    let event_time = parse_optional_time(
+    let provenance = parse_provenance(object.get("provenance"), &path, missing_data)?;
+    let actor = parse_signal_actor(object, &path, provenance, missing_data)?;
+    let event_time = parse_signal_event_time(
         object.get("eventTime"),
         &format!("{path}.eventTime"),
+        provenance,
+        &event_id,
         missing_data,
     )?;
-    let event_time = retain_in_input_window(event_time, input_window, &event_id, missing_data);
+    let event_time = retain_signal_in_input_window(
+        event_time,
+        input_window,
+        &event_id,
+        provenance,
+        missing_data,
+    );
 
     let resource_id = first_consistent_value(
         "resourceId",
@@ -606,6 +613,7 @@ fn parse_raw_signal(
         source,
         event_time,
         actor,
+        provenance,
         resource_id,
         client_id,
         target,
@@ -773,6 +781,139 @@ fn parse_posture_coverage(value: Option<&Value>) -> Result<bool, CorrelationErro
     Ok(assured)
 }
 
+fn parse_provenance(
+    value: Option<&Value>,
+    path: &str,
+    missing_data: &mut BTreeSet<String>,
+) -> Result<Option<ProvenanceV1>, CorrelationError> {
+    let Some(value) = value else {
+        missing_data.insert(format!("{path}.provenance:missing"));
+        return Ok(None);
+    };
+    if value.is_null() {
+        missing_data.insert(format!("{path}.provenance:missing"));
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| CorrelationError::new(format!("{path}.provenance must be an object")))?;
+    if require_string(object, "contractVersion")? != PROVENANCE_CONTRACT_VERSION {
+        return Err(CorrelationError::new(format!(
+            "{path}.provenance.contractVersion is unsupported"
+        )));
+    }
+    let actor_role = parse_actor_role(
+        require_string(object, "actorRole")?,
+        &format!("{path}.provenance.actorRole"),
+    )?;
+    let actor_source = parse_actor_source(
+        require_string(object, "actorSource")?,
+        &format!("{path}.provenance.actorSource"),
+    )?;
+    let temporal_basis = parse_temporal_basis(
+        require_string(object, "temporalBasis")?,
+        &format!("{path}.provenance.temporalBasis"),
+    )?;
+    Ok(Some(ProvenanceV1::new(
+        actor_role,
+        actor_source,
+        temporal_basis,
+    )))
+}
+
+fn parse_actor_role(value: &str, path: &str) -> Result<ActorRole, CorrelationError> {
+    match value {
+        "humanUser" => Ok(ActorRole::HumanUser),
+        "application" => Ok(ActorRole::Application),
+        "system" => Ok(ActorRole::System),
+        "resourceOwner" => Ok(ActorRole::ResourceOwner),
+        "target" => Ok(ActorRole::Target),
+        "affectedUser" => Ok(ActorRole::AffectedUser),
+        "subject" => Ok(ActorRole::Subject),
+        "unknown" => Ok(ActorRole::Unknown),
+        _ => Err(CorrelationError::new(format!("{path} is not allowlisted"))),
+    }
+}
+
+fn parse_actor_source(value: &str, path: &str) -> Result<ActorSource, CorrelationError> {
+    match value {
+        "googleActor" => Ok(ActorSource::GoogleActor),
+        "googleResourceOwner" => Ok(ActorSource::GoogleResourceOwner),
+        "googlePostureSubject" => Ok(ActorSource::GooglePostureSubject),
+        "microsoftInitiatedByUser" => Ok(ActorSource::MicrosoftInitiatedByUser),
+        "microsoftInitiatedByApp" => Ok(ActorSource::MicrosoftInitiatedByApp),
+        "microsoftInitiatedBySystem" => Ok(ActorSource::MicrosoftInitiatedBySystem),
+        "microsoftInitiatedByOpaqueId" => Ok(ActorSource::MicrosoftInitiatedByOpaqueId),
+        "microsoftSignInUser" => Ok(ActorSource::MicrosoftSignInUser),
+        "microsoftDefender" => Ok(ActorSource::MicrosoftDefender),
+        "crossCloudSubject" => Ok(ActorSource::CrossCloudSubject),
+        "providerSubject" => Ok(ActorSource::ProviderSubject),
+        "unknown" => Ok(ActorSource::Unknown),
+        _ => Err(CorrelationError::new(format!("{path} is not allowlisted"))),
+    }
+}
+
+fn parse_temporal_basis(value: &str, path: &str) -> Result<TemporalBasis, CorrelationError> {
+    match value {
+        "providerEventTime" => Ok(TemporalBasis::ProviderEventTime),
+        "snapshotObservedAt" => Ok(TemporalBasis::SnapshotObservedAt),
+        "snapshotGeneratedAt" => Ok(TemporalBasis::SnapshotGeneratedAt),
+        "stateLastLoginTime" => Ok(TemporalBasis::StateLastLoginTime),
+        "unknown" => Ok(TemporalBasis::Unknown),
+        _ => Err(CorrelationError::new(format!("{path} is not allowlisted"))),
+    }
+}
+
+fn parse_signal_actor(
+    object: &Map<String, Value>,
+    path: &str,
+    provenance: Option<ProvenanceV1>,
+    missing_data: &mut BTreeSet<String>,
+) -> Result<Option<String>, CorrelationError> {
+    let actor = optional_string(object, "actor", &format!("{path}.actor"))?;
+    if provenance.is_some_and(ProvenanceV1::actor_correlation_eligible) {
+        return match actor.as_deref().and_then(validated_email) {
+            Some(actor) => Ok(Some(actor)),
+            None => {
+                missing_data.insert(format!("{path}.actor:ambiguous_or_missing"));
+                Ok(None)
+            }
+        };
+    }
+    if actor.is_some() {
+        missing_data.insert(format!("{path}.actor:not_eligible"));
+    }
+    Ok(None)
+}
+
+fn parse_signal_event_time(
+    value: Option<&Value>,
+    path: &str,
+    provenance: Option<ProvenanceV1>,
+    event_id: &str,
+    missing_data: &mut BTreeSet<String>,
+) -> Result<Option<DateTime<Utc>>, CorrelationError> {
+    let event_time = parse_optional_time(value, path, missing_data)?;
+    if !provenance.is_some_and(ProvenanceV1::temporal_correlation_eligible) {
+        missing_data.insert(format!("{event_id}:causal_time_unavailable"));
+        return Ok(None);
+    }
+    Ok(event_time)
+}
+
+fn retain_signal_in_input_window(
+    value: Option<DateTime<Utc>>,
+    input_window: &CorrelationWindow,
+    event_id: &str,
+    provenance: Option<ProvenanceV1>,
+    missing_data: &mut BTreeSet<String>,
+) -> Option<DateTime<Utc>> {
+    if !provenance.is_some_and(ProvenanceV1::temporal_correlation_eligible) {
+        return None;
+    }
+    retain_in_input_window(value, input_window, event_id, missing_data)
+}
+
 fn parse_posture_signal(
     value: &Value,
     index: usize,
@@ -799,18 +940,22 @@ fn parse_posture_signal(
     let source_detail =
         bounded_string(require_string(object, "source")?, &format!("{path}.source"))?;
     validate_posture_source(&source_detail, &format!("{path}.source"))?;
-    let actor = optional_string(object, "actor", &format!("{path}.actor"))?.and_then(|value| {
-        normalize_email(&value).or_else(|| {
-            missing_data.insert(format!("{path}.actor:ambiguous_or_missing"));
-            None
-        })
-    });
-    let event_time = parse_optional_time(
+    let provenance = parse_provenance(object.get("provenance"), &path, missing_data)?;
+    let actor = parse_signal_actor(object, &path, provenance, missing_data)?;
+    let event_time = parse_signal_event_time(
         object.get("eventTime"),
         &format!("{path}.eventTime"),
+        provenance,
+        &event_id,
         missing_data,
     )?;
-    let event_time = retain_in_input_window(event_time, input_window, &event_id, missing_data);
+    let event_time = retain_signal_in_input_window(
+        event_time,
+        input_window,
+        &event_id,
+        provenance,
+        missing_data,
+    );
     let evidence = parse_evidence(
         object.get("evidence"),
         POSTURE_EVIDENCE_KEYS,
@@ -823,6 +968,7 @@ fn parse_posture_signal(
         source: "posture".to_string(),
         event_time,
         actor,
+        provenance,
         resource_id: None,
         client_id: None,
         target: None,
@@ -859,27 +1005,44 @@ fn parse_security_posture_signal(
         &format!("{path}.controlId"),
     )?;
     validate_posture_token(&rule, &format!("{path}.controlId"))?;
-    let subject = require_string(object, "subject")?.to_string();
-    let actor = normalize_email(&subject).or_else(|| {
-        missing_data.insert(format!("{path}.subject:ambiguous_or_missing"));
-        None
-    });
+    bounded_string(
+        require_string(object, "subject")?,
+        &format!("{path}.subject"),
+    )?;
+    let provenance = parse_provenance(object.get("provenance"), &path, missing_data)?;
+    let actor = parse_signal_actor(object, &path, provenance, missing_data)?;
     let evidence = parse_evidence(
         object.get("evidence"),
         POSTURE_EVIDENCE_KEYS,
         &format!("{path}.evidence"),
     )?;
-    let event_time = ["createdDateTime", "activityDateTime", "lastLoginTime"]
-        .iter()
-        .find_map(|key| {
-            evidence
-                .get(*key)
-                .and_then(|value| parse_timestamp(value, key).ok())
-        });
-    if event_time.is_none() {
+    let event_time_value = provenance.and_then(|value| {
+        value
+            .temporal_correlation_eligible()
+            .then(|| {
+                ["createdDateTime", "activityDateTime"]
+                    .iter()
+                    .find_map(|key| {
+                        evidence
+                            .get(*key)
+                            .and_then(|value| parse_timestamp(value, key).ok())
+                    })
+            })
+            .flatten()
+    });
+    if event_time_value.is_none() {
         missing_data.insert(format!("{path}.eventTime:missing"));
     }
-    let event_time = retain_in_input_window(event_time, input_window, &event_id, missing_data);
+    if !provenance.is_some_and(ProvenanceV1::temporal_correlation_eligible) {
+        missing_data.insert(format!("{event_id}:causal_time_unavailable"));
+    }
+    let event_time = retain_signal_in_input_window(
+        event_time_value,
+        input_window,
+        &event_id,
+        provenance,
+        missing_data,
+    );
     let counter_evidence = object
         .get("analysis")
         .and_then(Value::as_object)
@@ -891,6 +1054,7 @@ fn parse_security_posture_signal(
         source: "posture".to_string(),
         event_time,
         actor,
+        provenance,
         resource_id: None,
         client_id: None,
         target: None,
@@ -908,8 +1072,18 @@ fn parse_security_posture_signal(
 fn build_indexes(signals: &[Signal]) -> BTreeMap<String, BTreeMap<String, Vec<usize>>> {
     let mut indexes: BTreeMap<String, BTreeMap<String, Vec<usize>>> = BTreeMap::new();
     for (index, signal) in signals.iter().enumerate() {
+        if !signal
+            .provenance
+            .is_some_and(ProvenanceV1::temporal_correlation_eligible)
+        {
+            continue;
+        }
+        let actor = signal
+            .provenance
+            .filter(|provenance| provenance.actor_correlation_eligible())
+            .and(signal.actor.as_ref());
         for (dimension, value) in [
-            ("actor", signal.actor.as_ref()),
+            ("actor", actor),
             ("resourceId", signal.resource_id.as_ref()),
             ("oauthClient", signal.client_id.as_ref()),
             ("target", signal.target.as_ref()),
@@ -1205,10 +1379,13 @@ fn parse_evidence(
         let value = value
             .as_str()
             .ok_or_else(|| CorrelationError::new(format!("{path}.{key} must be a string")))?;
-        evidence.insert(
-            key.clone(),
-            bounded_string(value, &format!("{path}.{key}"))?,
-        );
+        let value_path = format!("{path}.{key}");
+        let value = if key == "activityDisplayName" {
+            bounded_activity_display_name(value, &value_path)?
+        } else {
+            bounded_string(value, &value_path)?
+        };
+        evidence.insert(key.clone(), value);
     }
     Ok(evidence)
 }
@@ -1321,10 +1498,10 @@ fn first_consistent_value(
     path: &str,
 ) -> Result<Option<String>, CorrelationError> {
     let first = first
-        .map(|value| safe_match_value(value, &format!("{path}.{name}")))
+        .map(|value| safe_match_value(value, &format!("{path}.{name}"), name == "resourceId"))
         .transpose()?;
     let second = second
-        .map(|value| safe_match_value(value, &format!("{path}.{name}")))
+        .map(|value| safe_match_value(value, &format!("{path}.{name}"), name == "resourceId"))
         .transpose()?;
     if first.is_some() && second.is_some() && first != second {
         return Err(CorrelationError::new(format!(
@@ -1334,7 +1511,11 @@ fn first_consistent_value(
     Ok(first.or(second))
 }
 
-fn safe_match_value(value: &str, path: &str) -> Result<String, CorrelationError> {
+fn safe_match_value(
+    value: &str,
+    path: &str,
+    allow_rfc_message_id_delimiters: bool,
+) -> Result<String, CorrelationError> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized.len() > 254 || normalized.chars().any(char::is_control) {
         return Err(CorrelationError::new(format!(
@@ -1344,43 +1525,16 @@ fn safe_match_value(value: &str, path: &str) -> Result<String, CorrelationError>
     if normalized.chars().any(char::is_whitespace) {
         return Err(CorrelationError::new(format!("{path} contains whitespace")));
     }
-    if !normalized
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || "-_.:@/+=".contains(character))
-    {
+    if !normalized.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || "-_.:@/+=".contains(character)
+            || (allow_rfc_message_id_delimiters && "<>".contains(character))
+    }) {
         return Err(CorrelationError::new(format!(
             "{path} contains an unsafe identifier character"
         )));
     }
     Ok(normalized)
-}
-
-fn normalize_email(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let (local, domain) = normalized.split_once('@')?;
-    if local.is_empty()
-        || domain.is_empty()
-        || !normalized.is_ascii()
-        || normalized.len() > 254
-        || normalized.matches('@').count() != 1
-        || normalized
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-        || !domain.contains('.')
-        || local.chars().any(|character| {
-            !character.is_ascii_alphanumeric() && !".!#$%&'*+/=?^_`{|}~-".contains(character)
-        })
-        || domain
-            .chars()
-            .any(|character| !character.is_ascii_alphanumeric() && !matches!(character, '-' | '.'))
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || domain.starts_with('-')
-        || domain.ends_with('-')
-    {
-        return None;
-    }
-    Some(normalized)
 }
 
 fn validate_posture_source(value: &str, path: &str) -> Result<(), CorrelationError> {
@@ -1441,6 +1595,18 @@ fn optional_string(
 }
 
 fn bounded_string(value: &str, path: &str) -> Result<String, CorrelationError> {
+    bounded_string_with_marker_policy(value, path, true)
+}
+
+fn bounded_activity_display_name(value: &str, path: &str) -> Result<String, CorrelationError> {
+    bounded_string_with_marker_policy(value, path, false)
+}
+
+fn bounded_string_with_marker_policy(
+    value: &str,
+    path: &str,
+    reject_literal_secret_marker: bool,
+) -> Result<String, CorrelationError> {
     if value.is_empty()
         || value.chars().count() > MAX_TEXT_LENGTH
         || value.chars().any(char::is_control)
@@ -1455,10 +1621,11 @@ fn bounded_string(value: &str, path: &str) -> Result<String, CorrelationError> {
         "refresh_token",
         "client_secret",
         "private_key",
-        "secret",
+        "secret-token",
     ]
     .iter()
     .any(|marker| value.to_ascii_lowercase().contains(marker))
+        || (reject_literal_secret_marker && value.to_ascii_lowercase().contains("secret"))
     {
         return Err(CorrelationError::new(format!(
             "{path} contains a sensitive marker"
@@ -1483,6 +1650,7 @@ fn signal_fingerprint_key(signal: &Signal) -> Value {
         "source": signal.source,
         "eventTime": signal.event_time.map(canonical_time),
         "actor": signal.actor,
+        "provenance": signal.provenance,
         "resourceId": signal.resource_id,
         "clientId": signal.client_id,
         "target": signal.target,
@@ -1529,6 +1697,7 @@ mod tests {
             "severity": "high",
             "rule": rule,
             "actor": actor,
+            "provenance": explicit_google_provenance(),
             "occurrences": 1,
             "evidence": {}
         });
@@ -1537,6 +1706,15 @@ mod tests {
             object.insert(key.clone(), item.clone());
         }
         value
+    }
+
+    fn explicit_google_provenance() -> serde_json::Value {
+        json!({
+            "contractVersion": "security_intelligence_provenance_v1",
+            "actorRole": "humanUser",
+            "actorSource": "googleActor",
+            "temporalBasis": "providerEventTime"
+        })
     }
 
     fn input(findings: Vec<serde_json::Value>) -> serde_json::Value {
@@ -1554,7 +1732,7 @@ mod tests {
     }
 
     fn two_source_findings(actor: &str, prefix: &str, start_minute: u32) -> Vec<serde_json::Value> {
-        vec![
+        let mut findings = vec![
             finding(
                 &format!("{prefix}-login"),
                 Some(&format!("2026-08-02T12:{start_minute:02}:00Z")),
@@ -1571,7 +1749,111 @@ mod tests {
                 actor,
                 json!({"resourceId": format!("resource-{prefix}")}),
             ),
-        ]
+        ];
+        for finding in &mut findings {
+            finding
+                .as_object_mut()
+                .expect("finding object")
+                .insert("provenance".to_string(), explicit_google_provenance());
+        }
+        findings
+    }
+
+    #[test]
+    fn historical_v1_input_without_provenance_is_accepted_but_not_correlated() {
+        let mut findings = two_source_findings("user@example.com", "legacy", 1);
+        for finding in &mut findings {
+            finding
+                .as_object_mut()
+                .expect("finding object")
+                .remove("provenance");
+        }
+        let report = input(findings);
+
+        let output = super::correlate_report(&report, 30, 50).expect("input remains readable");
+
+        assert!(output["correlations"].as_array().unwrap().is_empty());
+        assert!(output["failClosed"].as_bool().unwrap());
+        assert!(output["missingData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "finding[0].provenance:missing"));
+    }
+
+    #[test]
+    fn snapshot_observed_and_generated_times_never_become_causal_event_time() {
+        let mut findings = two_source_findings("user@example.com", "snapshot", 1);
+        for finding in &mut findings {
+            let object = finding.as_object_mut().expect("finding object");
+            object.insert(
+                "provenance".to_string(),
+                json!({
+                    "contractVersion": "security_intelligence_provenance_v1",
+                    "actorRole": "humanUser",
+                    "actorSource": "googleActor",
+                    "temporalBasis": "snapshotObservedAt"
+                }),
+            );
+            object.insert("observedAt".to_string(), json!("2026-08-02T12:00:00Z"));
+            object.insert("generatedAt".to_string(), json!("2026-08-02T12:00:01Z"));
+        }
+        let report = input(findings);
+
+        let output = super::correlate_report(&report, 30, 50).expect("input remains readable");
+
+        assert!(output["correlations"].as_array().unwrap().is_empty());
+        assert!(output["missingData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "snapshot-login:causal_time_unavailable"));
+    }
+
+    #[test]
+    fn historical_security_posture_without_provenance_is_readable_but_not_causal() {
+        let mut report = input(Vec::new());
+        report["securityPosture"] = json!({
+            "schemaVersion": "security_intelligence_v1",
+            "generatedAt": "2026-08-02T12:00:01Z",
+            "coverageComplete": false,
+            "coverage": [{
+                "source": "google.users",
+                "status": "available",
+                "requested": true,
+                "required": true,
+                "assured": true
+            }],
+            "identityPosture": [{
+                "findingId": "legacy-posture-1",
+                "controlId": "GOOGLE.IDENTITY.STALE_ACTIVE_ACCOUNT",
+                "provider": "googleWorkspace",
+                "severity": "high",
+                "contextualVerdict": "ALERT",
+                "title": "Cuenta activa sin uso reciente",
+                "subject": "person@example.com",
+                "summary": "La cuenta permanece habilitada.",
+                "evidence": {"lastLoginTime": "2026-07-20T12:00:00Z"},
+                "analysis": {}
+            }],
+            "controlPosture": [],
+            "crossCloudCorrelations": [],
+            "signalFindings": []
+        });
+
+        let output = super::correlate_report(&report, 30, 50).expect("legacy input is readable");
+
+        assert!(output["correlations"].as_array().unwrap().is_empty());
+        assert!(output["missingData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item == "securityPosture.identityPosture[0].provenance:missing" }));
+        assert!(output["missingData"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item == "legacy-posture-1:causal_time_unavailable" }));
     }
 
     #[test]
@@ -1586,11 +1868,11 @@ mod tests {
             "sources": ["login", "admin", "token", "drive", "rules"],
             "findingCount": 5,
             "findings": [
-                {"eventId":"login-1","eventTime":"2026-08-02T12:01:00Z","source":"login","eventName":"suspicious_login","severity":"critical","rule":"google_suspicious_login","actor":"User@Example.com","occurrences":1,"evidence":{}},
-                {"eventId":"admin-1","eventTime":"2026-08-02T12:04:00Z","source":"admin","eventName":"ASSIGN_ROLE","severity":"critical","rule":"admin_role_assigned","actor":"user@example.com","occurrences":1,"evidence":{}},
-                {"eventId":"token-1","eventTime":"2026-08-02T12:07:00Z","source":"token","eventName":"authorize","severity":"high","rule":"oauth_application_authorized","actor":"user@example.com","occurrences":1,"evidence":{"client_id":"client-1"}},
-                {"eventId":"drive-1","eventTime":"2026-08-02T12:10:00Z","source":"drive","eventName":"change_user_access","severity":"high","rule":"drive_shared_outside_trusted_domains","actor":"user@example.com","resourceId":"file-1","target":"outside@example.net","occurrences":1,"evidence":{"doc_id":"file-1","target_user":"outside@example.net"}},
-                {"eventId":"rules-1","eventTime":"2026-08-02T12:13:00Z","source":"rules","eventName":"rule_trigger","severity":"high","rule":"dlp_rule_triggered","actor":"user@example.com","occurrences":1,"evidence":{"rule_name":"sensitive-data"}}
+                {"eventId":"login-1","eventTime":"2026-08-02T12:01:00Z","source":"login","eventName":"suspicious_login","severity":"critical","rule":"google_suspicious_login","actor":"User@Example.com","provenance": explicit_google_provenance(),"occurrences":1,"evidence":{}},
+                {"eventId":"admin-1","eventTime":"2026-08-02T12:04:00Z","source":"admin","eventName":"ASSIGN_ROLE","severity":"critical","rule":"admin_role_assigned","actor":"user@example.com","provenance": explicit_google_provenance(),"occurrences":1,"evidence":{}},
+                {"eventId":"token-1","eventTime":"2026-08-02T12:07:00Z","source":"token","eventName":"authorize","severity":"high","rule":"oauth_application_authorized","actor":"user@example.com","provenance": explicit_google_provenance(),"occurrences":1,"evidence":{"client_id":"client-1"}},
+                {"eventId":"drive-1","eventTime":"2026-08-02T12:10:00Z","source":"drive","eventName":"change_user_access","severity":"high","rule":"drive_shared_outside_trusted_domains","actor":"user@example.com","provenance": explicit_google_provenance(),"resourceId":"file-1","target":"outside@example.net","occurrences":1,"evidence":{"doc_id":"file-1","target_user":"outside@example.net"}},
+                {"eventId":"rules-1","eventTime":"2026-08-02T12:13:00Z","source":"rules","eventName":"rule_trigger","severity":"high","rule":"dlp_rule_triggered","actor":"user@example.com","provenance": explicit_google_provenance(),"occurrences":1,"evidence":{"rule_name":"sensitive-data"}}
             ]
         });
 
@@ -1646,8 +1928,8 @@ mod tests {
                 "coverage": [{"source":"microsoft.signIns","status":"available","requested":true,"required":true,"assured":true}],
                 "findings": [{
                     "eventId":"posture-1",
-                    "controlId":"MSFT.SIGNAL.RISKY_SIGN_IN",
-                    "rule":"MSFT.SIGNAL.RISKY_SIGN_IN",
+                    "controlId":"MSFT.SIGNAL.DIRECTORY_CHANGE",
+                    "rule":"MSFT.SIGNAL.DIRECTORY_CHANGE",
                     "provider":"microsoft365",
                     "source":"microsoft.signIns",
                     "sourceKind":"microsoft365",
@@ -1657,6 +1939,12 @@ mod tests {
                     "confidence":"medium",
                     "urgency":"today",
                     "actor":"user@example.com",
+                    "provenance": {
+                        "contractVersion":"security_intelligence_provenance_v1",
+                        "actorRole":"humanUser",
+                        "actorSource":"microsoftInitiatedByUser",
+                        "temporalBasis":"providerEventTime"
+                    },
                     "quickView":"risky sign-in",
                     "whyFlagged":"review",
                     "evidence":{"conditionalAccessStatus":"failure"},
@@ -1689,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn already_available_cross_cloud_signal_is_context_only_and_fail_closed_when_partial() {
+    fn already_available_cross_cloud_signal_is_context_only_and_not_an_actor() {
         let mut report = input(vec![
             finding(
                 "login-1",
@@ -1729,6 +2017,12 @@ mod tests {
                     "confidence":"high",
                     "urgency":"immediate",
                     "actor":"user@example.com",
+                    "provenance": {
+                        "contractVersion":"security_intelligence_provenance_v1",
+                        "actorRole":"affectedUser",
+                        "actorSource":"crossCloudSubject",
+                        "temporalBasis":"snapshotGeneratedAt"
+                    },
                     "quickView":"cross-cloud signal",
                     "whyFlagged":"review",
                     "evidence":{"googleEventId":"login-1","googleRule":"google_suspicious_login","microsoftSignInId":"sign-in-1"},
@@ -1741,18 +2035,17 @@ mod tests {
 
         let output =
             super::correlate_report(&report, 30, 50).expect("local posture should be readable");
-        let actor = output["correlations"]
+        assert!(!output["correlations"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["matchedBy"] == "actor" && item["eventCount"] == 3)
-            .expect("cross-cloud signal should be correlated by exact actor");
-
-        assert!(actor["sources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|source| source == "posture"));
+            .any(|item| {
+                item["matchedBy"] == "actor"
+                    && item["eventCount"] == 3
+                    && item["sources"]
+                        .as_array()
+                        .is_some_and(|sources| sources.iter().any(|source| source == "posture"))
+            }));
         assert!(output["failClosed"].as_bool().unwrap());
         assert_eq!(output["coverage"][5]["status"], "unavailable");
     }
@@ -1837,6 +2130,113 @@ mod tests {
         assert_eq!(resource["contextualVerdict"], "CONTRADICTORY");
         assert!(output["failClosed"].as_bool().unwrap());
         assert!(!output["contradictions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn accepts_rfc_message_id_resource_identifiers_without_relaxing_path_controls() {
+        let resource_id = "message-<synthetic@example.invalid>";
+        let report = input(vec![
+            finding(
+                "rules-1",
+                Some("2026-08-02T12:01:00Z"),
+                "rules",
+                "dlp_user_warned",
+                "first@example.com",
+                json!({"resourceId": resource_id}),
+            ),
+            finding(
+                "drive-1",
+                Some("2026-08-02T12:02:00Z"),
+                "drive",
+                "drive_public_link_enabled",
+                "second@example.com",
+                json!({"resourceId": resource_id}),
+            ),
+        ]);
+
+        let output = super::correlate_report(&report, 30, 50)
+            .expect("provider resource identifier should be accepted");
+        assert!(output["correlations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["matchedBy"] == "resourceId"));
+
+        for invalid_resource_id in [
+            "message?<synthetic@example.invalid>",
+            "message#<synthetic@example.invalid>",
+            "message-\n<synthetic@example.invalid>",
+        ] {
+            let invalid_report = input(vec![finding(
+                "rules-invalid",
+                Some("2026-08-02T12:01:00Z"),
+                "rules",
+                "dlp_user_warned",
+                "first@example.com",
+                json!({"resourceId": invalid_resource_id}),
+            )]);
+            let error = super::correlate_report(&invalid_report, 30, 50)
+                .expect_err("path and control characters must remain rejected");
+            assert!(error.to_string().contains("resourceId"));
+        }
+
+        let invalid_target_report = input(vec![finding(
+            "rules-invalid-target",
+            Some("2026-08-02T12:01:00Z"),
+            "rules",
+            "dlp_user_warned",
+            "first@example.com",
+            json!({"target": "recipient<synthetic@example.invalid>"}),
+        )]);
+        let error = super::correlate_report(&invalid_target_report, 30, 50)
+            .expect_err("message-id delimiters must remain rejected for non-resource fields");
+        assert!(error.to_string().contains("target"));
+    }
+
+    #[test]
+    fn treats_activity_display_name_as_metadata_not_a_secret_body() {
+        let mut report = input(Vec::new());
+        report["monitorIntegration"] = json!({
+            "security_intelligence_monitor_v1": {
+                "contractVersion": "security_intelligence_monitor_v1",
+                "status": "incomplete",
+                "coverageComplete": false,
+                "requiredCoverageComplete": false,
+                "failClosed": true,
+                "coverage": [{"source":"google.users","status":"available","requested":true,"required":true,"assured":true}],
+                "findings": [{
+                    "eventId":"posture-synthetic-1",
+                    "controlId":"MSFT.SIGNAL.DIRECTORY_CHANGE",
+                    "rule":"MSFT.SIGNAL.DIRECTORY_CHANGE",
+                    "provider":"microsoft365",
+                    "source":"microsoft.directoryAudits",
+                    "sourceKind":"microsoft365",
+                    "eventTime":"2026-08-02T12:02:00Z",
+                    "rawSeverity":"high",
+                    "contextualVerdict":"ALERT",
+                    "confidence":"medium",
+                    "urgency":"today",
+                    "actor":"user@example.com",
+                    "quickView":"synthetic directory activity",
+                    "whyFlagged":"review",
+                    "evidence":{"activityDisplayName":"Synthetic secret metadata label"},
+                    "assertions":[],
+                    "narrative":{"conclusion":"review","whyItMatters":"review","observedEvidence":[],"counterEvidence":[],"whatWeDoNotKnow":"scope unknown","whatToDoNow":"review","urgency":"today"},
+                    "links":[]
+                }]
+            }
+        });
+
+        let output = super::correlate_report(&report, 30, 50)
+            .expect("allowlisted activity metadata should be readable");
+        assert_eq!(output["status"], "incomplete");
+
+        let mut blocked = report;
+        blocked["monitorIntegration"]["security_intelligence_monitor_v1"]["findings"][0]
+            ["evidence"]["activityDisplayName"] = json!("Synthetic secret-token marker");
+        let error = super::correlate_report(&blocked, 30, 50)
+            .expect_err("credential-shaped markers must remain rejected");
+        assert!(error.to_string().contains("sensitive marker"));
     }
 
     #[test]

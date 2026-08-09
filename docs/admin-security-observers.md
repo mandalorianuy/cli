@@ -345,6 +345,20 @@ happened; a recommendation records a proposed human decision. Recommended
 states are `proposed`, `accepted`, `rejected`, and `implemented`. The observer
 never changes a recommendation state and never applies a DLP or sharing rule.
 
+### Fail-closed provenance (T10-CORR4)
+
+Findings and correlations use `security_intelligence_provenance_v1` to keep
+actor role/source separate from temporal evidence. Human actor correlation is
+eligible only for a validated Google actor or Microsoft `initiatedBy.user`
+paired with provider event time. Resource owners, targets, affected users,
+subjects, opaque IDs, applications, systems, snapshots, and `lastLoginTime`
+remain context and are never promoted to human causality.
+
+Missing or non-provider time stays fail-closed. Snapshot `generatedAt` and
+`observedAt` describe collection context; they do not establish when a causal
+event occurred. Historical inputs remain readable but cannot pass actor/time
+correlation gates without the explicit provenance fields.
+
 ### Local context correlation (T7)
 
 `+security-monitor-correlate` reads one bounded observer JSON file and produces
